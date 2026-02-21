@@ -1,0 +1,56 @@
+# frOSt Shell Customization
+# Sourced from /etc/profile.d/frost-prompt.sh
+
+# Only apply to interactive shells
+case $- in
+    *i*) ;;
+    *) return;;
+esac
+
+# ── frOSt prompt ──────────────────────────────────────
+# Style: [user@host] path
+#        frost>
+#
+# Colors: red brackets, cyan user@host, blue path, cyan prompt
+
+__frost_prompt() {
+    local last_exit=$?
+    local RED='\[\033[0;31m\]'
+    local CYAN='\[\033[1;36m\]'
+    local BLUE='\[\033[0;34m\]'
+    local DIM='\[\033[0;90m\]'
+    local GREEN='\[\033[1;32m\]'
+    local RESET='\[\033[0m\]'
+
+    # Show exit code if non-zero
+    local exit_indicator=""
+    if [ $last_exit -ne 0 ]; then
+        exit_indicator="${RED}[${last_exit}] "
+    fi
+
+    PS1="${exit_indicator}${RED}[${CYAN}\u${RED}@${CYAN}\h${RED}]${RESET} ${BLUE}\w${RESET}\n${CYAN}frost>${RESET} "
+}
+
+PROMPT_COMMAND='__frost_prompt'
+
+# ── frOSt aliases ─────────────────────────────────────
+alias ll='ls -lah --color=auto'
+alias la='ls -A --color=auto'
+alias l='ls -CF --color=auto'
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+alias diff='diff --color=auto'
+
+# frOSt tool aliases
+alias status='frost-overlay status'
+alias persist='frost-persist list'
+alias overlay='frost-overlay layers'
+
+# ── Colors for ls ─────────────────────────────────────
+export LS_COLORS='di=1;36:ln=35:so=32:pi=33:ex=1;32:bd=34;46:cd=34;43:su=30;41:sg=30;46:tw=30;42:ow=34;43'
+
+# ── Neofetch on first login ───────────────────────────
+if [ -z "$FROST_GREETED" ] && command -v neofetch >/dev/null 2>&1; then
+    export FROST_GREETED=1
+    neofetch --config /etc/frost/neofetch.conf 2>/dev/null || neofetch
+fi

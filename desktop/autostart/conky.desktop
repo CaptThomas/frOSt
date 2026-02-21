@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=frOSt System Monitor
+Comment=Conky system monitor for frOSt desktop
+Exec=sh -c "sleep 3 && conky -c /etc/frost/conky.conf"
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
+X-XFCE-Autostart-Override=true

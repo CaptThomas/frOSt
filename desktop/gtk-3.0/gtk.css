@@ -1,0 +1,190 @@
+/* frOSt GTK3 Theme Overlay
+ * Applied on top of Adwaita-dark to add frost color accents
+ * Colors: cyan #00d4ff, red #ff2d2d, navy #0a1628
+ */
+
+/* Selection colors */
+*:selected,
+*:selected:focus {
+    background-color: #0090c1;
+    color: #e0f0ff;
+}
+
+selection {
+    background-color: #0090c1;
+    color: #e0f0ff;
+}
+
+/* Links */
+*:link, button:link {
+    color: #00d4ff;
+}
+
+/* Focused elements - cyan outline */
+*:focus {
+    outline-color: rgba(0, 212, 255, 0.5);
+}
+
+entry:focus,
+spinbutton:focus,
+textview:focus {
+    border-color: #0090c1;
+    box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.3);
+}
+
+/* Switches - cyan when active */
+switch:checked {
+    background-color: #0090c1;
+    border-color: #00779a;
+}
+
+switch:checked slider {
+    background-color: #00d4ff;
+}
+
+/* Check/Radio buttons */
+checkbutton check:checked,
+radiobutton radio:checked {
+    background-color: #0090c1;
+    border-color: #00779a;
+    color: #e0f0ff;
+}
+
+/* Progress bars */
+progressbar progress,
+levelbar block.filled {
+    background-color: #0090c1;
+}
+
+progressbar trough,
+levelbar trough {
+    background-color: #0f1f36;
+}
+
+/* Scale/slider */
+scale highlight {
+    background-color: #0090c1;
+}
+
+scale slider {
+    background-color: #00d4ff;
+}
+
+/* Scrollbar */
+scrollbar slider {
+    background-color: rgba(0, 144, 193, 0.5);
+    border-radius: 9999px;
+    min-width: 6px;
+    min-height: 6px;
+}
+
+scrollbar slider:hover {
+    background-color: rgba(0, 212, 255, 0.7);
+}
+
+/* Tooltip */
+tooltip {
+    background-color: #0f1f36;
+    border: 1px solid #1a3050;
+    color: #e0f0ff;
+}
+
+tooltip * {
+    color: #e0f0ff;
+}
+
+/* Headerbar / titlebar */
+headerbar, .titlebar {
+    background-color: #0a1628;
+    border-bottom: 1px solid #1a3050;
+    color: #e0f0ff;
+}
+
+headerbar:backdrop, .titlebar:backdrop {
+    background-color: #081220;
+    color: #6b8299;
+}
+
+/* Menu / popover */
+menu, .popup, popover {
+    background-color: #0f1f36;
+    border: 1px solid #1a3050;
+    color: #e0f0ff;
+}
+
+menu menuitem:hover,
+popover modelbutton:hover {
+    background-color: #152a44;
+    color: #e0f0ff;
+}
+
+/* Sidebar */
+.sidebar {
+    background-color: #0a1628;
+    border-right: 1px solid #1a3050;
+}
+
+.sidebar row:selected {
+    background-color: #152a44;
+    color: #00d4ff;
+}
+
+/* Notebook tabs */
+notebook header tabs tab:checked {
+    background-color: #152a44;
+    border-bottom: 2px solid #00d4ff;
+    color: #e0f0ff;
+}
+
+notebook header tabs tab {
+    color: #6b8299;
+}
+
+/* Button accent - subtle cyan border on hover */
+button:hover {
+    border-color: rgba(0, 144, 193, 0.4);
+}
+
+button.suggested-action {
+    background-color: #0090c1;
+    color: #e0f0ff;
+}
+
+button.suggested-action:hover {
+    background-color: #00a8e0;
+}
+
+button.destructive-action {
+    background-color: #cc2424;
+    color: #e0f0ff;
+}
+
+button.destructive-action:hover {
+    background-color: #ff2d2d;
+}
+
+/* View / treeview */
+treeview:selected,
+row:selected {
+    background-color: #152a44;
+    color: #e0f0ff;
+}
+
+/* Infobar */
+infobar.info {
+    background-color: #0090c1;
+}
+
+infobar.warning {
+    background-color: #b38600;
+}
+
+infobar.error {
+    background-color: #cc2424;
+}
+
+/* Calendar */
+calendar:selected {
+    background-color: #0090c1;
+    color: #e0f0ff;
+}
