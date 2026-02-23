@@ -91,7 +91,8 @@ network-manager-gnome,\
 fonts-hack,fonts-liberation2,\
 conky-all,neofetch,htop,\
 librsvg2-bin,\
-pulseaudio,pavucontrol \
+pulseaudio,pavucontrol,\
+gdisk,parted \
         "${DEBIAN_RELEASE}" \
         "${ROOTFS_DIR}" \
         "${DEBIAN_MIRROR}"
@@ -255,6 +256,36 @@ install_frost_tools() {
             sed -i '1i#!/usr/bin/env python3' "${bindir}/${tool}"
         fi
     done
+
+    # Install auto-expand persistence script
+    local sbindir="${ROOTFS_DIR}/usr/local/sbin"
+    mkdir -p "${sbindir}"
+    cp "${SRC_DIR}/tools/frost-expand-persist.sh" "${sbindir}/frost-expand-persist"
+    chmod 755 "${sbindir}/frost-expand-persist"
+
+    # Create systemd service for auto-expand
+    cat > "${ROOTFS_DIR}/etc/systemd/system/frost-expand-persist.service" << 'EXPANDSVC'
+[Unit]
+Description=Expand frOSt persistence partition to fill disk
+DefaultDependencies=no
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/frost-expand-persist
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EXPANDSVC
+
+    # Enable the service
+    chroot "${ROOTFS_DIR}" bash -c "
+        systemctl enable frost-expand-persist.service 2>/dev/null || true
+    "
 
     ok "frOSt tools installed"
 }

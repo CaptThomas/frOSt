@@ -123,15 +123,15 @@ You can also right-click `deploy-usb.ps1` and select **Run with PowerShell**.
 |------|-------------|
 | `-DiskNumber N` | Target physical disk number (auto-detects USB if omitted) |
 | `-ImagePath` | Path to frost.img on Windows filesystem |
-| `-NoExpand` | Skip expanding the persistence partition |
 | `-Yes` | Skip the confirmation prompt |
 
 The script will:
 1. Locate the frOSt image (from `-ImagePath`, project directory, or copy from WSL)
 2. Detect USB drives and confirm the target
 3. Write the raw image to the USB using direct disk I/O
-4. Attempt to expand the persistence partition to fill the drive
-5. Bring the disk back online
+4. Bring the disk back online
+
+The persistence partition auto-expands to fill the USB on first boot via a systemd service.
 
 #### Bash (Git Bash / WSL - Alternative)
 

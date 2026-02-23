@@ -10,14 +10,12 @@
 #
 # Options:
 #   -DiskNumber N   Target physical disk number (auto-detects USB if omitted)
-#   -NoExpand       Skip expanding persistence partition
 #   -Yes            Skip confirmation prompt
 #   -ImagePath      Path to frost.img (copies from WSL if not specified)
 # =============================================================================
 
 param(
     [int]$DiskNumber = -1,
-    [switch]$NoExpand,
     [switch]$Yes,
     [string]$ImagePath = "",
     [string]$WslImage = "/root/frost-build/frost.img"
@@ -70,7 +68,6 @@ if (-not $isAdmin) {
     Log "Requesting Administrator privileges..."
     $argList = "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
     if ($DiskNumber -ge 0) { $argList += " -DiskNumber $DiskNumber" }
-    if ($NoExpand) { $argList += " -NoExpand" }
     if ($Yes) { $argList += " -Yes" }
     if ($ImagePath) { $argList += " -ImagePath `"$ImagePath`"" }
     if ($WslImage -ne "/root/frost-build/frost.img") { $argList += " -WslImage `"$WslImage`"" }
@@ -195,7 +192,13 @@ Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | ForEach-Objec
         } catch { }
     }
 }
-Start-Sleep 1
+
+# Clean disk to release Windows' lock on partition volumes
+Log "Cleaning disk to release volume locks..."
+"select disk $diskNum`nclean" | Out-File "$env:TEMP\frost-dp.txt" -Encoding ASCII
+$dpOut = diskpart /s "$env:TEMP\frost-dp.txt" 2>&1
+"Diskpart clean: $dpOut" | Out-File $LogFile -Append -Encoding UTF8
+Start-Sleep 2
 
 # === Write image directly using .NET raw disk I/O ===
 Log "Writing frOSt image to USB ($imgMB MB)..."
@@ -252,86 +255,9 @@ try {
     Err "Failed to write image: $_"
 }
 
-# === Fix GPT and expand partition ===
-if (-not $NoExpand) {
-    Log "Attempting to fix GPT and expand persistence partition..."
-
-    # Try WSL mount for GPT fix (may not work on all systems)
-    Start-Sleep 2
-    $wslMountOk = $false
-    wsl --unmount "\\.\PHYSICALDRIVE$diskNum" 2>$null
-    Start-Sleep 1
-
-    $mountResult = wsl --mount "\\.\PHYSICALDRIVE$diskNum" --bare 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $wslMountOk = $true
-        Start-Sleep 3
-
-        # Find device in WSL
-        $wslDev = (wsl -d Ubuntu -u root -- bash -c "
-for dev in /dev/sd?; do
-    [ -b `$dev ] || continue
-    sz=`$(blockdev --getsize64 `$dev 2>/dev/null || echo 0)
-    diff=`$(( sz - $diskSizeBytes ))
-    [ `$diff -lt 0 ] && diff=`$(( -diff ))
-    if [ `$diff -lt 2147483648 ]; then
-        echo `$dev
-        exit 0
-    fi
-done
-for dev in /dev/sdi /dev/sdh /dev/sdg /dev/sdf /dev/sde; do
-    [ -b `$dev ] && echo `$dev && exit 0
-done
-" 2>&1).Trim()
-
-        if ($wslDev -and $wslDev -match "^/dev/sd") {
-            Ok "USB device in WSL: $wslDev"
-
-            $fixOutput = wsl -d Ubuntu -u root -- bash -c "
-DEV='$wslDev'
-echo 'Fixing GPT backup table...'
-sgdisk -e `$DEV 2>&1 || echo 'sgdisk -e skipped'
-partprobe `$DEV 2>/dev/null
-sleep 2
-PART3=`${DEV}3
-if [ -b `$PART3 ]; then
-    echo 'Expanding partition 3...'
-    parted -s `$DEV resizepart 3 100% 2>&1 || echo 'Resize skipped'
-    partprobe `$DEV 2>/dev/null
-    sleep 1
-    echo 'Checking filesystem...'
-    e2fsck -f -y `$PART3 2>&1 || true
-    echo 'Resizing filesystem...'
-    resize2fs `$PART3 2>&1 || true
-    NEW=`$(blockdev --getsize64 `$PART3 2>/dev/null || echo 0)
-    echo `"Persistence: `$(( NEW / 1073741824 )) GB`"
-else
-    echo 'Partition 3 not found - skipping expansion'
-fi
-echo 'Final layout:'
-parted -s `$DEV print 2>/dev/null
-sync
-echo 'DONE'
-" 2>&1
-            $fixOutput | ForEach-Object { Write-Host "  $_" }
-            $fixOutput | Out-File $LogFile -Append -Encoding UTF8
-            Ok "GPT fixed and persistence expanded"
-        } else {
-            Warn "Could not find USB device in WSL - skipping expansion"
-        }
-
-        # Unmount
-        wsl -d Ubuntu -u root -- sync 2>$null
-        Start-Sleep 2
-        wsl --unmount "\\.\PHYSICALDRIVE$diskNum" 2>$null
-        Start-Sleep 2
-    } else {
-        Warn "WSL mount not available - persistence expansion skipped"
-        Warn "The USB is bootable but partition 3 has not been expanded."
-        Warn "To expand later, boot frOSt and run: sudo parted /dev/sda resizepart 3 100% && sudo resize2fs /dev/sda3"
-        "WSL mount failed: $mountResult" | Out-File $LogFile -Append -Encoding UTF8
-    }
-}
+# Note: Persistence partition expansion happens automatically on first boot
+# via the frost-expand-persist systemd service. No need to expand here.
+Ok "Persistence partition will auto-expand on first boot"
 
 # === Bring disk online ===
 Log "Bringing disk online..."
@@ -358,6 +284,8 @@ Write-Host ""
 Write-Host "  ======================================================" -ForegroundColor Green
 Write-Host "    frOSt deployed successfully to USB!" -ForegroundColor Green
 Write-Host "  ======================================================" -ForegroundColor Green
+Write-Host ""
+Write-Host "  Persistence partition will auto-expand on first boot." -ForegroundColor White
 Write-Host ""
 Write-Host "  To boot on real hardware:" -ForegroundColor White
 Write-Host "    1. Insert USB into target machine" -ForegroundColor White
