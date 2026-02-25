@@ -83,11 +83,13 @@ iproute2,iputils-ping,net-tools,bash,coreutils,util-linux,mount,\
 kmod,procps,passwd,login,adduser,sudo,locales,\
 linux-image-amd64,grub-efi-amd64,grub-pc-bin,\
 xfce4,xfce4-terminal,lightdm,lightdm-gtk-greeter,\
-xorg,xserver-xorg-video-all,dbus-x11,at-spi2-core,\
+xorg,xserver-xorg-video-all,dbus-x11,at-spi2-core,policykit-1,\
 xfce4-whiskermenu-plugin,xfce4-screenshooter,\
 xfce4-power-manager,xfce4-taskmanager,\
 mousepad,thunar-archive-plugin,file-roller,\
 network-manager-gnome,\
+wpasupplicant,iw,wireless-tools,rfkill,wireless-regdb,\
+firmware-linux-free,\
 fonts-hack,fonts-liberation2,\
 conky-all,neofetch,htop,\
 librsvg2-bin,\
@@ -142,7 +144,7 @@ SOURCES
     chroot "${ROOTFS_DIR}" bash -c "
         adduser --disabled-password --gecos 'frOSt User' frost 2>/dev/null || true
         echo 'frost:frost' | chpasswd
-        usermod -aG sudo frost
+        usermod -aG sudo,video,audio,plugdev,netdev frost
     "
 
     # Configure sudo for frost user
@@ -159,6 +161,26 @@ ExecStart=
 ExecStart=-/sbin/agetty --autologin frost --noclear %I $TERM
 Type=idle
 AUTOLOGIN
+
+    # Configure NetworkManager to manage all interfaces (including WiFi)
+    cat > "${ROOTFS_DIR}/etc/NetworkManager/NetworkManager.conf" << 'NMCONF'
+[main]
+plugins=ifupdown,keyfile
+
+[ifupdown]
+managed=true
+
+[device]
+wifi.scan-rand-mac-address=no
+NMCONF
+
+    # Set /etc/network/interfaces to loopback only (NM manages everything else)
+    cat > "${ROOTFS_DIR}/etc/network/interfaces" << 'IFACES'
+# Managed by NetworkManager
+source /etc/network/interfaces.d/*
+auto lo
+iface lo inet loopback
+IFACES
 
     # Install frOSt tools
     install_frost_tools
