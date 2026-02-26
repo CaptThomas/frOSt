@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=frOSt Compositor
+Comment=Picom compositor for shadows, fading and transparency
+Exec=picom --config /home/frost/.config/picom/picom.conf -b
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
+X-XFCE-Autostart-Override=true

@@ -1,13 +1,17 @@
 #!/bin/bash
 # =============================================================================
-# frOSt Build System - Master Build Script
+# frOSt Build System v2.0
 # =============================================================================
 # Builds a complete frOSt bootable USB disk image:
-#   1. Creates a minimal Debian rootfs via debootstrap
-#   2. Assembles the x86-64 early init binary
-#   3. Builds the initramfs (asm stub + shell init + busybox)
-#   4. Creates a partitioned disk image with GRUB
-#   5. Packs everything into a bootable image
+#   1. Creates a Debian rootfs via debootstrap (with all packages)
+#   2. Configures system (users, networking, NTP, hardware detection, browser)
+#   3. Installs desktop environment (XFCE4 + picom + theming)
+#   4. Assembles the x86-64 early init binary
+#   5. Builds the initramfs (asm stub + shell init + busybox + modules)
+#   6. Creates a partitioned disk image with GRUB
+#
+# All fixes from incremental fix scripts are integrated here.
+# This is the single source of truth for the build.
 #
 # Requirements: debootstrap, nasm, grub, mtools, squashfs-tools, python3
 # Must run as root inside Linux (WSL or native)
@@ -15,70 +19,76 @@
 
 set -euo pipefail
 
-# Configuration
-FROST_VERSION="1.0.0"
+# ─── Configuration ───────────────────────────────────────────────────────────
+FROST_VERSION="2.0.0"
 BUILD_DIR="/root/frost-build"
 ROOTFS_DIR="${BUILD_DIR}/rootfs"
 INITRAMFS_DIR="${BUILD_DIR}/initramfs"
 IMAGE_FILE="${BUILD_DIR}/frost.img"
-IMAGE_SIZE_MB=4096
+IMAGE_SIZE_MB=3072
 EFI_SIZE_MB=256
-ROOT_SIZE_MB=2400
+ROOT_SIZE_MB=2000
 DEBIAN_RELEASE="bookworm"
 DEBIAN_MIRROR="http://deb.debian.org/debian"
 
-# Source directory (where this script lives)
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Colors
+# ─── Logging ─────────────────────────────────────────────────────────────────
 RED='\033[1;31m'
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[1;36m'
 RESET='\033[0m'
 
-log() { echo -e "${CYAN}[frOSt-build]${RESET} $1"; }
+log() { echo -e "${CYAN}[frOSt]${RESET} $1"; }
 ok()  { echo -e "${GREEN}[OK]${RESET} $1"; }
 warn(){ echo -e "${YELLOW}[WARN]${RESET} $1"; }
 err() { echo -e "${RED}[ERROR]${RESET} $1"; exit 1; }
+
+# ─── Chroot helpers ──────────────────────────────────────────────────────────
+mount_chroot() {
+    mount --bind /dev "${ROOTFS_DIR}/dev" 2>/dev/null || true
+    mount --bind /dev/pts "${ROOTFS_DIR}/dev/pts" 2>/dev/null || true
+    mount -t proc proc "${ROOTFS_DIR}/proc" 2>/dev/null || true
+    mount -t sysfs sysfs "${ROOTFS_DIR}/sys" 2>/dev/null || true
+    mount -t tmpfs tmpfs "${ROOTFS_DIR}/tmp" 2>/dev/null || true
+}
+
+umount_chroot() {
+    umount -l "${ROOTFS_DIR}/tmp" 2>/dev/null || true
+    umount -l "${ROOTFS_DIR}/sys" 2>/dev/null || true
+    umount -l "${ROOTFS_DIR}/proc" 2>/dev/null || true
+    umount -l "${ROOTFS_DIR}/dev/pts" 2>/dev/null || true
+    umount -l "${ROOTFS_DIR}/dev" 2>/dev/null || true
+}
 
 # =============================================================================
 # Step 0: Pre-flight checks
 # =============================================================================
 preflight() {
-    log "Running pre-flight checks..."
-
-    [[ $EUID -eq 0 ]] || err "Must run as root (use sudo)"
-
+    log "Pre-flight checks..."
+    [[ $EUID -eq 0 ]] || err "Must run as root"
     for cmd in debootstrap nasm mksquashfs grub-mkimage parted mkfs.fat mkfs.ext4 cpio; do
-        command -v $cmd >/dev/null 2>&1 || err "Missing required command: $cmd"
+        command -v $cmd >/dev/null 2>&1 || err "Missing: $cmd"
     done
-
-    ok "All dependencies found"
+    ok "Dependencies found"
 }
 
 # =============================================================================
-# Step 1: Create Debian rootfs via debootstrap
+# Step 1: Debootstrap rootfs with all packages
 # =============================================================================
 build_rootfs() {
     log "Building Debian rootfs (${DEBIAN_RELEASE})..."
-
-    # Clean up any stale mounts from a previous failed build
-    umount -l "${ROOTFS_DIR}/dev/pts" 2>/dev/null || true
-    umount -l "${ROOTFS_DIR}/dev" 2>/dev/null || true
-    umount -l "${ROOTFS_DIR}/proc" 2>/dev/null || true
-    umount -l "${ROOTFS_DIR}/sys" 2>/dev/null || true
-    umount -l "${ROOTFS_DIR}/tmp" 2>/dev/null || true
-
+    umount_chroot
     rm -rf "${ROOTFS_DIR}"
     mkdir -p "${ROOTFS_DIR}"
 
-    # Debootstrap with all packages (including desktop)
-    # NOTE: All packages must be in --include because apt-get doesn't work
-    # reliably in chroot under WSL2 (apt HTTP method hangs)
+    # All packages in one debootstrap call (apt unreliable in WSL chroot)
     debootstrap \
         --variant=minbase \
-        --include=systemd,systemd-sysv,udev,dbus,apt,python3,python3-minimal,\
+        --components=main,contrib,non-free,non-free-firmware \
+        --include=systemd,systemd-sysv,systemd-timesyncd,udev,dbus,apt,\
+python3,python3-minimal,python3-pil,\
 iproute2,iputils-ping,net-tools,bash,coreutils,util-linux,mount,\
 kmod,procps,passwd,login,adduser,sudo,locales,\
 linux-image-amd64,grub-efi-amd64,grub-pc-bin,\
@@ -89,141 +99,286 @@ xfce4-power-manager,xfce4-taskmanager,\
 mousepad,thunar-archive-plugin,file-roller,\
 network-manager-gnome,\
 wpasupplicant,iw,wireless-tools,rfkill,wireless-regdb,\
-firmware-linux-free,\
-fonts-hack,fonts-liberation2,\
+firmware-linux-free,firmware-iwlwifi,\
+fonts-hack,fonts-liberation2,fonts-noto-color-emoji,\
 conky-all,neofetch,htop,\
 librsvg2-bin,\
 pulseaudio,pavucontrol,\
-gdisk,parted \
+gdisk,parted,pciutils,usbutils,\
+picom,papirus-icon-theme,\
+firefox-esr \
         "${DEBIAN_RELEASE}" \
         "${ROOTFS_DIR}" \
         "${DEBIAN_MIRROR}"
 
     ok "Debootstrap complete"
-
-    # Configure the rootfs
     configure_rootfs
 }
 
 # =============================================================================
-# Configure the rootfs
+# Step 2: Configure rootfs (users, networking, services, hardware)
 # =============================================================================
 configure_rootfs() {
     log "Configuring rootfs..."
 
-    # Set hostname
+    # ── Hostname / hosts ──
     echo "frost" > "${ROOTFS_DIR}/etc/hostname"
-
-    # Set hosts
-    cat > "${ROOTFS_DIR}/etc/hosts" << 'HOSTS'
+    cat > "${ROOTFS_DIR}/etc/hosts" << 'EOF'
 127.0.0.1   localhost
 127.0.1.1   frost
 ::1         localhost ip6-localhost ip6-loopback
-HOSTS
+EOF
 
-    # Set up fstab - minimal since overlay handles most
-    cat > "${ROOTFS_DIR}/etc/fstab" << 'FSTAB'
-# frOSt filesystem table
-# Most filesystems are managed by the overlay system
-# This file is overridden during boot by the initramfs
+    # ── Fstab ──
+    cat > "${ROOTFS_DIR}/etc/fstab" << 'EOF'
 tmpfs   /tmp    tmpfs   defaults,nosuid,nodev   0 0
 tmpfs   /run    tmpfs   defaults,nosuid,nodev   0 0
-FSTAB
+EOF
 
-    # Configure apt sources
-    cat > "${ROOTFS_DIR}/etc/apt/sources.list" << SOURCES
+    # ── Apt sources (main + contrib + non-free + firmware) ──
+    cat > "${ROOTFS_DIR}/etc/apt/sources.list" << EOF
 deb ${DEBIAN_MIRROR} ${DEBIAN_RELEASE} main contrib non-free non-free-firmware
 deb ${DEBIAN_MIRROR} ${DEBIAN_RELEASE}-updates main contrib non-free non-free-firmware
 deb http://security.debian.org/debian-security ${DEBIAN_RELEASE}-security main contrib non-free non-free-firmware
-SOURCES
+EOF
 
-    # Set root password to 'frost'
-    chroot "${ROOTFS_DIR}" bash -c "echo 'root:frost' | chpasswd"
-
-    # Create frost user
+    # ── Users ──
     chroot "${ROOTFS_DIR}" bash -c "
+        echo 'root:frost' | chpasswd
         adduser --disabled-password --gecos 'frOSt User' frost 2>/dev/null || true
         echo 'frost:frost' | chpasswd
         usermod -aG sudo,video,audio,plugdev,netdev frost
     "
-
-    # Configure sudo for frost user
-    cat > "${ROOTFS_DIR}/etc/sudoers.d/frost" << 'SUDOERS'
+    cat > "${ROOTFS_DIR}/etc/sudoers.d/frost" << 'EOF'
 frost ALL=(ALL) NOPASSWD: ALL
-SUDOERS
+EOF
     chmod 440 "${ROOTFS_DIR}/etc/sudoers.d/frost"
 
-    # Enable auto-login on tty1
+    # ── Autologin on tty1 ──
     mkdir -p "${ROOTFS_DIR}/etc/systemd/system/getty@tty1.service.d"
-    cat > "${ROOTFS_DIR}/etc/systemd/system/getty@tty1.service.d/autologin.conf" << 'AUTOLOGIN'
+    cat > "${ROOTFS_DIR}/etc/systemd/system/getty@tty1.service.d/autologin.conf" << 'EOF'
 [Service]
 ExecStart=
 ExecStart=-/sbin/agetty --autologin frost --noclear %I $TERM
 Type=idle
-AUTOLOGIN
+EOF
 
-    # Configure NetworkManager to manage all interfaces (including WiFi)
-    cat > "${ROOTFS_DIR}/etc/NetworkManager/NetworkManager.conf" << 'NMCONF'
+    # ── NetworkManager ──
+    cat > "${ROOTFS_DIR}/etc/NetworkManager/NetworkManager.conf" << 'EOF'
 [main]
 plugins=ifupdown,keyfile
+dns=default
 
 [ifupdown]
 managed=true
 
 [device]
 wifi.scan-rand-mac-address=no
-NMCONF
-
-    # Set /etc/network/interfaces to loopback only (NM manages everything else)
-    cat > "${ROOTFS_DIR}/etc/network/interfaces" << 'IFACES'
-# Managed by NetworkManager
+EOF
+    cat > "${ROOTFS_DIR}/etc/network/interfaces" << 'EOF'
 source /etc/network/interfaces.d/*
 auto lo
 iface lo inet loopback
-IFACES
+EOF
 
-    # Install frOSt tools
-    install_frost_tools
+    # ── DNS fallback (NetworkManager overwrites on boot with DHCP DNS) ──
+    cat > "${ROOTFS_DIR}/etc/resolv.conf" << 'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
+EOF
 
-    # Configure login message
-    cat > "${ROOTFS_DIR}/etc/motd" << 'MOTD'
+    # ── NTP time sync ──
+    cat > "${ROOTFS_DIR}/etc/systemd/timesyncd.conf" << 'EOF'
+[Time]
+NTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org 3.debian.pool.ntp.org
+FallbackNTP=0.pool.ntp.org 1.pool.ntp.org 2.pool.ntp.org
+RootDistanceMaxSec=5
+PollIntervalMinSec=32
+PollIntervalMaxSec=2048
+EOF
 
- [0;36m     *        [0m
- [0;36m    /|\       [0m
- [0;36m   / | \      [0m
- [0;36m--/  |  \--   [0;37m  __       ___  ____  _   [0m
- [0;36m\  | /  \  [0;37m / _|_ __ / _ \/ ___|| |_ [0m
- [0;36m*---\-|-/---* [0;37m| |_| '__| | | \___ \| __|[0m
- [0;36m \  / \|/ \ / [0;37m|  _| |  | |_| |___) | |_ [0m
- [0;36m  \/   *   \/ [0;37m|_| |_|   \___/|____/ \__|[0m
- [0;36m  /\  /|\  /\ [0m
- [0;36m /  \/ | \/  \[0;31m  ───────────────────────────[0m
- [0;36m*---/-|-\---* [0;37m  Frozen Operating System v1.0[0m
- [0;36m \  /  |  \ / [0;36m  Overlay: [0;32mACTIVE[0;36m  Persist: [0;32mON[0m
- [0;36m  --\  |  /-- [0m
- [0;36m     \ | /    [0;90m  All changes are transient unless[0m
- [0;36m      \|/     [0;90m  you persist them explicitly.[0m
- [0;36m       *      [0m
+    # ── iwlwifi configuration ──
+    cat > "${ROOTFS_DIR}/etc/modprobe.d/iwlwifi.conf" << 'EOF'
+options iwlmvm power_scheme=1
+EOF
+    # ── Module autoload for WiFi stack ──
+    cat > "${ROOTFS_DIR}/etc/modules-load.d/iwlwifi.conf" << 'EOF'
+rfkill
+cfg80211
+mac80211
+iwlwifi
+iwlmvm
+EOF
 
- [1;36m Quick commands:[0m
-   [0;36mfrost-persist list[0m       [0;90m- See what's persistent[0m
-   [0;36mfrost-persist add <path>[0m [0;90m- Make a path persistent[0m
-   [0;36mfrost-config wizard[0m      [0;90m- Run setup wizard[0m
-   [0;36mfrost-overlay status[0m     [0;90m- Check overlay status[0m
-
-MOTD
-
-    # Set up locale
+    # ── Locale ──
     chroot "${ROOTFS_DIR}" bash -c "
         echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen
         locale-gen 2>/dev/null || true
     "
+    # ── Timezone ──
+    chroot "${ROOTFS_DIR}" bash -c "
+        ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+        echo 'UTC' > /etc/timezone
+    "
 
-    # Create frost config directory
+    # ── MOTD ──
+    cat > "${ROOTFS_DIR}/etc/motd" << 'EOF'
+
+  [0;36m     *        [0m
+  [0;36m    /|\       [0m  [1;37m__       ___  ____  _   [0m
+  [0;36m   / | \      [0m [0;37m/ _|_ __ / _ \/ ___|| |_ [0m
+  [0;36m--/  |  \--   [0m[0;37m| |_| '__| | | \___ \| __|[0m
+  [0;36m\  | /  \  [0m[0;37m|  _| |  | |_| |___) | |_ [0m
+  [0;36m*---\-|-/---* [0m[0;37m|_| |_|   \___/|____/ \__|[0m
+  [0;36m \  / \|/ \ / [0m
+  [0;36m  \/   *   \/ [0m [1;36mFrozen Operating System v2.0[0m
+  [0;36m  /\  /|\  /\ [0m [0;36mOverlay: [0;32mACTIVE[0m  [0;36mPersist: [0;32mON[0m
+  [0;36m /  \/ | \/  \[0m
+  [0;36m       *      [0m [0;90mAll changes are transient unless persisted.[0m
+
+  [1;36mQuick commands:[0m
+    [0;36mfrost-persist list[0m        - See persistent paths
+    [0;36mfrost-persist add <path>[0m  - Persist a path
+    [0;36mfrost-overlay status[0m      - Overlay info
+
+EOF
+
+    ok "Base system configured"
+
+    install_frost_tools
+    install_services
+}
+
+# =============================================================================
+# Strip bloat from rootfs (~500MB+ savings)
+# =============================================================================
+strip_bloat() {
+    log "Stripping bloat from rootfs..."
+    local saved=0
+    local before after
+
+    # ── Locales: keep only en_US (saves ~160MB) ──
+    before=$(du -sm "${ROOTFS_DIR}/usr/share/locale/" 2>/dev/null | cut -f1)
+    find "${ROOTFS_DIR}/usr/share/locale/" -mindepth 1 -maxdepth 1 -type d \
+        ! -name 'en' ! -name 'en_US' ! -name 'en_GB' ! -name 'locale.alias' \
+        -exec rm -rf {} + 2>/dev/null || true
+    after=$(du -sm "${ROOTFS_DIR}/usr/share/locale/" 2>/dev/null | cut -f1)
+    saved=$((saved + before - after))
+    ok "Locales stripped: ${before}M -> ${after}M"
+
+    # ── Docs and man pages (saves ~60MB) ──
+    before=$(du -sm "${ROOTFS_DIR}/usr/share/doc/" "${ROOTFS_DIR}/usr/share/man/" 2>/dev/null | awk '{s+=$1}END{print s}')
+    rm -rf "${ROOTFS_DIR}/usr/share/doc/"*
+    rm -rf "${ROOTFS_DIR}/usr/share/man/"*
+    rm -rf "${ROOTFS_DIR}/usr/share/info/"*
+    rm -rf "${ROOTFS_DIR}/usr/share/lintian/"*
+    mkdir -p "${ROOTFS_DIR}/usr/share/doc" "${ROOTFS_DIR}/usr/share/man"
+    ok "Docs/man stripped: ${before}M saved"
+    saved=$((saved + before))
+
+    # ── Icon themes: keep only Papirus-Dark + hicolor (saves ~250MB) ──
+    before=$(du -sm "${ROOTFS_DIR}/usr/share/icons/" 2>/dev/null | cut -f1)
+    for theme in Papirus ePapirus ePapirus-Dark Papirus-Light Adwaita; do
+        rm -rf "${ROOTFS_DIR}/usr/share/icons/${theme}" 2>/dev/null || true
+    done
+    after=$(du -sm "${ROOTFS_DIR}/usr/share/icons/" 2>/dev/null | cut -f1)
+    saved=$((saved + before - after))
+    ok "Icons stripped: ${before}M -> ${after}M"
+
+    # ── GCC (not needed at runtime, saves ~32MB) ──
+    rm -rf "${ROOTFS_DIR}/lib/gcc" 2>/dev/null || true
+
+    # ── Perl (not needed for desktop use, saves ~21MB) ──
+    # Keep perl binary but remove modules we don't need
+    rm -rf "${ROOTFS_DIR}/usr/share/perl" 2>/dev/null || true
+
+    # ── i18n data (saves ~17MB) ──
+    rm -rf "${ROOTFS_DIR}/usr/share/i18n/locales/"* 2>/dev/null || true
+    # Keep charmaps needed for en_US
+    find "${ROOTFS_DIR}/usr/share/i18n/charmaps/" -type f \
+        ! -name 'UTF-8.gz' ! -name 'ISO-8859-1.gz' ! -name 'ANSI*' \
+        -delete 2>/dev/null || true
+
+    # ── Poppler data (PDF rendering data, saves ~13MB) ──
+    rm -rf "${ROOTFS_DIR}/usr/share/poppler" 2>/dev/null || true
+
+    # ── Ghostscript (saves ~3MB) ──
+    rm -rf "${ROOTFS_DIR}/usr/share/ghostscript" 2>/dev/null || true
+
+    # ── Aspell (spell checker data, saves ~1.7MB) ──
+    rm -rf "${ROOTFS_DIR}/lib/aspell" 2>/dev/null || true
+
+    # ── GRUB modules in rootfs (already on EFI partition, saves ~22MB) ──
+    rm -rf "${ROOTFS_DIR}/lib/grub" 2>/dev/null || true
+    rm -rf "${ROOTFS_DIR}/usr/share/grub" 2>/dev/null || true
+
+    # ── Boot directory (kernel/initrd already on EFI, saves ~46MB) ──
+    # Save kernel to build dir first (needed for EFI partition later)
+    local kver
+    kver=$(ls "${ROOTFS_DIR}/lib/modules/" | head -1)
+    local vmlinuz="${ROOTFS_DIR}/boot/vmlinuz-${kver}"
+    [[ -f "${vmlinuz}" ]] || vmlinuz=$(find "${ROOTFS_DIR}/boot" -name 'vmlinuz-*' | head -1)
+    if [[ -f "${vmlinuz}" ]]; then
+        cp "${vmlinuz}" "${BUILD_DIR}/vmlinuz"
+        ok "Kernel saved to build dir"
+    fi
+    rm -f "${ROOTFS_DIR}/boot/vmlinuz-"* 2>/dev/null || true
+    rm -f "${ROOTFS_DIR}/boot/initrd.img-"* 2>/dev/null || true
+    rm -f "${ROOTFS_DIR}/boot/System.map-"* 2>/dev/null || true
+    rm -f "${ROOTFS_DIR}/boot/config-"* 2>/dev/null || true
+
+    # ── Python cache (saves ~5MB) ──
+    find "${ROOTFS_DIR}" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+    find "${ROOTFS_DIR}" -name '*.pyc' -delete 2>/dev/null || true
+
+    # ── Misc cleanup ──
+    rm -rf "${ROOTFS_DIR}/usr/share/help" 2>/dev/null || true
+    rm -rf "${ROOTFS_DIR}/usr/share/groff" 2>/dev/null || true
+    rm -rf "${ROOTFS_DIR}/usr/share/libwacom" 2>/dev/null || true
+    rm -rf "${ROOTFS_DIR}/usr/include" 2>/dev/null || true
+    rm -rf "${ROOTFS_DIR}/var/log/"* 2>/dev/null || true
+    rm -rf "${ROOTFS_DIR}/var/cache/ldconfig/"* 2>/dev/null || true
+
+    local total
+    total=$(du -sm "${ROOTFS_DIR}" | cut -f1)
+    ok "Bloat stripped (~${saved}M saved). Rootfs now: ${total}M"
+}
+
+# =============================================================================
+# Install frOSt CLI tools
+# =============================================================================
+install_frost_tools() {
+    log "Installing frOSt tools..."
+
+    local bindir="${ROOTFS_DIR}/usr/local/bin"
+    mkdir -p "${bindir}"
+
+    for tool in frost-persist frost-overlay frost-config; do
+        cp "${SRC_DIR}/tools/${tool}.py" "${bindir}/${tool}"
+        chmod 755 "${bindir}/${tool}"
+        if ! head -1 "${bindir}/${tool}" | grep -q '^#!'; then
+            sed -i '1i#!/usr/bin/env python3' "${bindir}/${tool}"
+        fi
+    done
+
+    local sbindir="${ROOTFS_DIR}/usr/local/sbin"
+    mkdir -p "${sbindir}"
+    cp "${SRC_DIR}/tools/frost-expand-persist.sh" "${sbindir}/frost-expand-persist"
+    chmod 755 "${sbindir}/frost-expand-persist"
+
     mkdir -p "${ROOTFS_DIR}/etc/frost"
+    ok "frOSt tools installed"
+}
 
-    # Create systemd service for frost persistence sync
-    cat > "${ROOTFS_DIR}/etc/systemd/system/frost-sync.service" << 'SERVICE'
+# =============================================================================
+# Install systemd services (persist sync, auto-expand, hw detect, boot diag)
+# =============================================================================
+install_services() {
+    log "Installing systemd services..."
+
+    # ── Persistence sync (runs at shutdown) ──
+    cat > "${ROOTFS_DIR}/etc/systemd/system/frost-sync.service" << 'EOF'
 [Unit]
 Description=frOSt Persistence Sync
 DefaultDependencies=no
@@ -236,57 +391,10 @@ RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-SERVICE
+EOF
 
-    # Enable the service
-    chroot "${ROOTFS_DIR}" bash -c "
-        systemctl enable frost-sync.service 2>/dev/null || true
-    "
-
-    # Clean up apt cache in rootfs (will be in squashfs, save space)
-    chroot "${ROOTFS_DIR}" bash -c "
-        apt-get clean
-        rm -rf /var/cache/apt/archives/*.deb
-        rm -rf /tmp/*
-        rm -rf /var/tmp/*
-    "
-
-    ok "Rootfs configured"
-}
-
-# =============================================================================
-# Install frOSt tools into rootfs
-# =============================================================================
-install_frost_tools() {
-    log "Installing frOSt tools..."
-
-    local bindir="${ROOTFS_DIR}/usr/local/bin"
-    mkdir -p "${bindir}"
-
-    # Copy Python tools
-    cp "${SRC_DIR}/tools/frost-persist.py" "${bindir}/frost-persist"
-    cp "${SRC_DIR}/tools/frost-overlay.py" "${bindir}/frost-overlay"
-    cp "${SRC_DIR}/tools/frost-config.py"  "${bindir}/frost-config"
-
-    chmod 755 "${bindir}/frost-persist"
-    chmod 755 "${bindir}/frost-overlay"
-    chmod 755 "${bindir}/frost-config"
-
-    # Add shebang if missing
-    for tool in frost-persist frost-overlay frost-config; do
-        if ! head -1 "${bindir}/${tool}" | grep -q '^#!'; then
-            sed -i '1i#!/usr/bin/env python3' "${bindir}/${tool}"
-        fi
-    done
-
-    # Install auto-expand persistence script
-    local sbindir="${ROOTFS_DIR}/usr/local/sbin"
-    mkdir -p "${sbindir}"
-    cp "${SRC_DIR}/tools/frost-expand-persist.sh" "${sbindir}/frost-expand-persist"
-    chmod 755 "${sbindir}/frost-expand-persist"
-
-    # Create systemd service for auto-expand
-    cat > "${ROOTFS_DIR}/etc/systemd/system/frost-expand-persist.service" << 'EXPANDSVC'
+    # ── Auto-expand persistence partition ──
+    cat > "${ROOTFS_DIR}/etc/systemd/system/frost-expand-persist.service" << 'EOF'
 [Unit]
 Description=Expand frOSt persistence partition to fill disk
 DefaultDependencies=no
@@ -302,307 +410,464 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-EXPANDSVC
+EOF
 
-    # Enable the service
+    # ── Hardware detection service ──
+    install_hwdetect
+
+    # ── Boot diagnostics ──
+    install_boot_diag
+
+    # Enable all services
+    mount_chroot
     chroot "${ROOTFS_DIR}" bash -c "
+        systemctl enable frost-sync.service 2>/dev/null || true
         systemctl enable frost-expand-persist.service 2>/dev/null || true
-    "
+        systemctl enable frost-hwdetect.service 2>/dev/null || true
+        systemctl enable frost-boot-diag.service 2>/dev/null || true
+        systemctl enable systemd-timesyncd.service 2>/dev/null || true
+        systemctl enable lightdm 2>/dev/null || true
+        systemctl enable NetworkManager.service 2>/dev/null || true
+        systemctl enable wpa_supplicant.service 2>/dev/null || true
 
-    ok "frOSt tools installed"
+        # Boot speed: disable services that block or slow boot
+        systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+        systemctl disable e2scrub_reap.service 2>/dev/null || true
+        systemctl disable systemd-pstore.service 2>/dev/null || true
+        systemctl disable remote-fs.target 2>/dev/null || true
+        systemctl mask NetworkManager-wait-online.service 2>/dev/null || true
+        systemctl mask plymouth-quit-wait.service 2>/dev/null || true
+    "
+    umount_chroot
+
+    ok "Services installed"
 }
 
 # =============================================================================
-# Install desktop environment and apply frOSt theme
+# Hardware detection script + service
+# =============================================================================
+install_hwdetect() {
+    cat > "${ROOTFS_DIR}/usr/local/sbin/frost-hwdetect" << 'HWDETECT'
+#!/bin/bash
+# frOSt Hardware Detection - loads kernel modules based on detected hardware
+LOG_TAG="frost-hwdetect"
+log() { echo "$1"; logger -t "$LOG_TAG" "$1" 2>/dev/null || true; }
+log "=== frOSt Hardware Detection ==="
+
+# WiFi
+if lspci -d 8086: 2>/dev/null | grep -qi 'network\|wireless\|wi-fi'; then
+    log "Intel WiFi detected"
+    for m in rfkill cfg80211 mac80211 iwlwifi iwlmvm; do modprobe $m 2>/dev/null; done
+    rfkill unblock wifi 2>/dev/null || true
+fi
+if lspci 2>/dev/null | grep -qi 'broadcom.*wireless\|BCM43'; then
+    log "Broadcom WiFi detected"
+    modprobe brcmfmac 2>/dev/null || modprobe wl 2>/dev/null || true
+fi
+if lspci 2>/dev/null | grep -qi 'realtek.*wireless\|RTL8'; then
+    log "Realtek WiFi detected"
+    modprobe rtw88_pci 2>/dev/null; modprobe rtw89_pci 2>/dev/null || true
+fi
+if lspci 2>/dev/null | grep -qi 'atheros\|qualcomm.*wireless\|QCA'; then
+    log "Qualcomm/Atheros WiFi detected"
+    modprobe ath9k 2>/dev/null; modprobe ath10k_pci 2>/dev/null; modprobe ath11k_pci 2>/dev/null || true
+fi
+if lspci 2>/dev/null | grep -qi 'mediatek.*wireless\|MT76'; then
+    log "MediaTek WiFi detected"
+    modprobe mt7921e 2>/dev/null || true
+fi
+
+# Ethernet
+if lspci 2>/dev/null | grep -qi 'realtek.*ethernet\|RTL81'; then
+    log "Realtek Ethernet detected"; modprobe r8169 2>/dev/null || true
+fi
+if lspci 2>/dev/null | grep -qi 'intel.*ethernet'; then
+    log "Intel Ethernet detected"; modprobe e1000e 2>/dev/null; modprobe igc 2>/dev/null || true
+fi
+
+# GPU
+if lspci -d 8086: 2>/dev/null | grep -qi 'VGA\|Display\|Graphics'; then
+    log "Intel GPU detected"; modprobe i915 2>/dev/null || true
+fi
+if lspci 2>/dev/null | grep -qi 'nvidia'; then
+    log "NVIDIA GPU detected"; modprobe nouveau 2>/dev/null || true
+fi
+if lspci 2>/dev/null | grep -qi 'amd.*vga\|amd.*display\|radeon'; then
+    log "AMD GPU detected"; modprobe amdgpu 2>/dev/null || true
+fi
+
+# Audio
+if lspci 2>/dev/null | grep -qi 'audio'; then
+    log "Audio detected"
+    modprobe snd_hda_intel 2>/dev/null; modprobe snd_hda_codec_realtek 2>/dev/null
+    modprobe snd_hda_codec_hdmi 2>/dev/null || true
+fi
+
+# Storage
+if lspci 2>/dev/null | grep -qi 'non-volatile\|nvme'; then
+    log "NVMe detected"; modprobe nvme 2>/dev/null || true
+fi
+if lspci 2>/dev/null | grep -qi 'ahci\|sata'; then
+    log "AHCI/SATA detected"; modprobe ahci 2>/dev/null || true
+fi
+
+# USB / Thunderbolt
+if lspci 2>/dev/null | grep -qi 'xhci\|ehci'; then
+    log "USB controllers detected"
+    modprobe xhci_pci 2>/dev/null; modprobe usb_storage 2>/dev/null || true
+fi
+if lspci 2>/dev/null | grep -qi 'thunderbolt'; then
+    log "Thunderbolt detected"; modprobe thunderbolt 2>/dev/null || true
+fi
+
+# Bluetooth
+if lsusb 2>/dev/null | grep -qi 'bluetooth\|8087:'; then
+    log "Bluetooth detected"
+    modprobe btusb 2>/dev/null; modprobe btintel 2>/dev/null; modprobe bluetooth 2>/dev/null || true
+fi
+
+# I2C (touchpad)
+if lspci 2>/dev/null | grep -qi 'smbus\|i2c'; then
+    log "I2C/SMBus detected"; modprobe i2c_hid_acpi 2>/dev/null || true
+fi
+
+log "=== Hardware Detection Complete ==="
+HWDETECT
+    chmod 755 "${ROOTFS_DIR}/usr/local/sbin/frost-hwdetect"
+
+    cat > "${ROOTFS_DIR}/etc/systemd/system/frost-hwdetect.service" << 'EOF'
+[Unit]
+Description=frOSt Hardware Detection
+DefaultDependencies=no
+After=systemd-modules-load.service systemd-udevd.service
+Before=network-pre.target NetworkManager.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/frost-hwdetect
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# =============================================================================
+# Boot diagnostics service (writes logs to persist partition)
+# =============================================================================
+install_boot_diag() {
+    cat > "${ROOTFS_DIR}/usr/local/sbin/frost-boot-diag" << 'DIAG'
+#!/bin/bash
+LOGDIR="/frost/persist/boot-logs"
+mkdir -p "$LOGDIR" 2>/dev/null || { LOGDIR="/tmp/frost-boot-logs"; mkdir -p "$LOGDIR"; }
+{
+    echo "=== frOSt Boot Diagnostics $(date) ==="
+    uname -a; echo "---"
+    free -h; echo "---"
+    df -h; echo "---"
+    mount | grep -E 'overlay|tmpfs|frost'; echo "---"
+    ip link show; ip addr show
+} > "$LOGDIR/boot-diag.log" 2>&1
+lspci > "$LOGDIR/lspci.log" 2>&1
+lsusb > "$LOGDIR/lsusb.log" 2>&1
+lsmod > "$LOGDIR/lsmod.log" 2>&1
+dmesg > "$LOGDIR/dmesg-boot.log" 2>&1
+journalctl -b --no-pager > "$LOGDIR/journal-boot.log" 2>&1
+timedatectl status > "$LOGDIR/time-status.log" 2>&1
+dpkg -l > "$LOGDIR/dpkg-list.log" 2>&1
+DIAG
+    chmod 755 "${ROOTFS_DIR}/usr/local/sbin/frost-boot-diag"
+
+    cat > "${ROOTFS_DIR}/etc/systemd/system/frost-boot-diag.service" << 'EOF'
+[Unit]
+Description=frOSt Boot Diagnostics
+After=multi-user.target NetworkManager.service frost-hwdetect.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/sbin/frost-boot-diag
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# =============================================================================
+# Step 3: Install desktop environment and theme
 # =============================================================================
 install_desktop() {
-    log "Configuring desktop environment..."
+    log "Installing desktop theme..."
 
-    # Mount essential filesystems for chroot operations
-    mount --bind /dev "${ROOTFS_DIR}/dev" 2>/dev/null || true
-    mount --bind /dev/pts "${ROOTFS_DIR}/dev/pts" 2>/dev/null || true
-    mount -t proc proc "${ROOTFS_DIR}/proc" 2>/dev/null || true
-    mount -t sysfs sysfs "${ROOTFS_DIR}/sys" 2>/dev/null || true
-    mount -t tmpfs tmpfs "${ROOTFS_DIR}/tmp" 2>/dev/null || true
-
-    # Enable LightDM as display manager
-    chroot "${ROOTFS_DIR}" bash -c "
-        systemctl enable lightdm 2>/dev/null || true
-    "
-
-    # ---- Apply frOSt theme ----
-    log "Applying frOSt desktop theme..."
-
-    # Create wallpaper directory and convert SVG to PNG
+    # ── Wallpaper ──
     mkdir -p "${ROOTFS_DIR}/usr/share/backgrounds/frost"
     cp "${SRC_DIR}/desktop/wallpaper.svg" "${ROOTFS_DIR}/usr/share/backgrounds/frost/"
     cp "${SRC_DIR}/desktop/frost-logo.svg" "${ROOTFS_DIR}/usr/share/backgrounds/frost/"
 
-    # Convert SVGs to PNG using rsvg-convert in chroot
+    mount_chroot
+
+    # Generate wallpaper PNG (procedural cyberpunk frost theme)
+    chroot "${ROOTFS_DIR}" python3 << 'WALLPAPER_PY'
+from PIL import Image, ImageDraw
+import math, random
+random.seed(42)
+W, H = 1920, 1080
+img = Image.new('RGB', (W, H), (8, 16, 32))
+draw = ImageDraw.Draw(img)
+# Dark gradient background
+for y in range(H):
+    r = int(8 + 6 * (y / H))
+    g = int(16 + 12 * (y / H))
+    b = int(32 + 20 * (y / H))
+    draw.line([(0, y), (W, y)], fill=(r, g, b))
+# Subtle grid
+for x in range(0, W, 60):
+    draw.line([(x, 0), (x, H)], fill=(15, 30, 55), width=1)
+for y in range(0, H, 60):
+    draw.line([(0, y), (W, y)], fill=(15, 30, 55), width=1)
+# Aurora streaks
+for _ in range(8):
+    y0 = random.randint(100, 500)
+    for x in range(W):
+        y = y0 + int(40 * math.sin(x * 0.008 + random.random()))
+        alpha = int(20 + 15 * math.sin(x * 0.003))
+        c = random.choice([(0, alpha, alpha*2), (0, int(alpha*1.5), alpha)])
+        draw.point((x, y), fill=c)
+# Particle stars
+for _ in range(200):
+    x, y = random.randint(0, W), random.randint(0, H)
+    b = random.randint(60, 180)
+    s = random.choice([1, 1, 1, 2])
+    draw.ellipse([x, y, x+s, y+s], fill=(b, b+20, b+40))
+# Frost crystal (center-bottom)
+cx, cy = W//2, H - 200
+for angle in range(0, 360, 60):
+    rad = math.radians(angle)
+    for length in range(40, 120, 10):
+        ex = cx + int(length * math.cos(rad))
+        ey = cy + int(length * math.sin(rad))
+        draw.line([(cx, cy), (ex, ey)], fill=(0, 100 + length, 180 + min(length, 75)), width=1)
+        # Branch
+        if length > 60:
+            for ba in [-30, 30]:
+                brad = math.radians(angle + ba)
+                blen = (length - 60) // 2
+                bx = ex + int(blen * math.cos(brad))
+                by = ey + int(blen * math.sin(brad))
+                draw.line([(ex, ey), (bx, by)], fill=(0, 80 + length, 160 + min(length, 75)), width=1)
+img.save('/usr/share/backgrounds/frost/wallpaper.png')
+print('Wallpaper generated: 1920x1080')
+WALLPAPER_PY
+
+    # Convert logo SVG to PNG
     chroot "${ROOTFS_DIR}" bash -c "
         if command -v rsvg-convert >/dev/null 2>&1; then
-            rsvg-convert -w 1920 -h 1080 /usr/share/backgrounds/frost/wallpaper.svg \
-                -o /usr/share/backgrounds/frost/wallpaper.png
             rsvg-convert -w 128 -h 128 /usr/share/backgrounds/frost/frost-logo.svg \
                 -o /usr/share/backgrounds/frost/frost-logo.png
-        else
-            echo 'WARNING: rsvg-convert not found, SVG wallpapers only'
         fi
     "
 
-    # Install LightDM configuration
-    cp "${SRC_DIR}/desktop/lightdm/lightdm.conf" \
-        "${ROOTFS_DIR}/etc/lightdm/lightdm.conf"
-    cp "${SRC_DIR}/desktop/lightdm/lightdm-gtk-greeter.conf" \
-        "${ROOTFS_DIR}/etc/lightdm/lightdm-gtk-greeter.conf"
+    umount_chroot
 
-    # Install XFCE4 default configs (system-wide defaults)
+    # ── LightDM ──
+    cp "${SRC_DIR}/desktop/lightdm/lightdm.conf" "${ROOTFS_DIR}/etc/lightdm/"
+    cp "${SRC_DIR}/desktop/lightdm/lightdm-gtk-greeter.conf" "${ROOTFS_DIR}/etc/lightdm/"
+    mkdir -p "${ROOTFS_DIR}/var/lib/lightdm/data"
+
+    # ── XFCE4 configs (system-wide defaults + frost user) ──
     local xdg_xfce="${ROOTFS_DIR}/etc/xdg/xfce4"
-    mkdir -p "${xdg_xfce}/xfconf/xfce-perchannel-xml"
-    mkdir -p "${xdg_xfce}/terminal"
-    cp "${SRC_DIR}/desktop/xfce4/xfconf/xfce-perchannel-xml/"*.xml \
-        "${xdg_xfce}/xfconf/xfce-perchannel-xml/"
-    cp "${SRC_DIR}/desktop/xfce4/terminal/terminalrc" \
-        "${xdg_xfce}/terminal/"
-
-    # Also copy to frost user home for immediate use
     local user_xfce="${ROOTFS_DIR}/home/frost/.config/xfce4"
-    mkdir -p "${user_xfce}/xfconf/xfce-perchannel-xml"
-    mkdir -p "${user_xfce}/terminal"
-    cp "${SRC_DIR}/desktop/xfce4/xfconf/xfce-perchannel-xml/"*.xml \
-        "${user_xfce}/xfconf/xfce-perchannel-xml/"
-    cp "${SRC_DIR}/desktop/xfce4/terminal/terminalrc" \
-        "${user_xfce}/terminal/"
 
-    # Install GTK3 theme overlay
+    mkdir -p "${xdg_xfce}/xfconf/xfce-perchannel-xml" "${xdg_xfce}/terminal"
+    mkdir -p "${user_xfce}/xfconf/xfce-perchannel-xml" "${user_xfce}/terminal"
+
+    cp "${SRC_DIR}/desktop/xfce4/xfconf/xfce-perchannel-xml/"*.xml "${xdg_xfce}/xfconf/xfce-perchannel-xml/"
+    cp "${SRC_DIR}/desktop/xfce4/xfconf/xfce-perchannel-xml/"*.xml "${user_xfce}/xfconf/xfce-perchannel-xml/"
+    cp "${SRC_DIR}/desktop/xfce4/terminal/terminalrc" "${xdg_xfce}/terminal/"
+    cp "${SRC_DIR}/desktop/xfce4/terminal/terminalrc" "${user_xfce}/terminal/"
+
+    # ── Picom compositor ──
+    local user_picom="${ROOTFS_DIR}/home/frost/.config/picom"
+    mkdir -p "${user_picom}"
+    cp "${SRC_DIR}/desktop/picom/picom.conf" "${user_picom}/"
+
+    # ── GTK3 theme overlay ──
     local user_gtk="${ROOTFS_DIR}/home/frost/.config/gtk-3.0"
     local sys_gtk="${ROOTFS_DIR}/etc/gtk-3.0"
     mkdir -p "${user_gtk}" "${sys_gtk}"
     cp "${SRC_DIR}/desktop/gtk-3.0/gtk.css" "${user_gtk}/"
     cp "${SRC_DIR}/desktop/gtk-3.0/gtk.css" "${sys_gtk}/"
 
-    # Install Conky config
-    mkdir -p "${ROOTFS_DIR}/etc/frost"
+    # ── Conky ──
     cp "${SRC_DIR}/desktop/conky/conky.conf" "${ROOTFS_DIR}/etc/frost/"
 
-    # Install Conky autostart
+    # ── Autostart entries ──
     local user_autostart="${ROOTFS_DIR}/home/frost/.config/autostart"
     local sys_autostart="${ROOTFS_DIR}/etc/xdg/autostart"
     mkdir -p "${user_autostart}" "${sys_autostart}"
     cp "${SRC_DIR}/desktop/autostart/conky.desktop" "${user_autostart}/"
     cp "${SRC_DIR}/desktop/autostart/conky.desktop" "${sys_autostart}/"
+    cp "${SRC_DIR}/desktop/autostart/picom.desktop" "${user_autostart}/"
+    cp "${SRC_DIR}/desktop/autostart/picom.desktop" "${sys_autostart}/"
 
-    # Install Neofetch config
+    # ── Neofetch ──
     local user_neofetch="${ROOTFS_DIR}/home/frost/.config/neofetch"
     mkdir -p "${user_neofetch}"
     cp "${SRC_DIR}/desktop/neofetch/config.conf" "${ROOTFS_DIR}/etc/frost/neofetch.conf"
     cp "${SRC_DIR}/desktop/neofetch/config.conf" "${user_neofetch}/"
     cp "${SRC_DIR}/desktop/neofetch/frost-ascii" "${user_neofetch}/"
 
-    # Install frost shell prompt
+    # ── Shell prompt ──
     cp "${SRC_DIR}/desktop/bashrc-frost" "${ROOTFS_DIR}/etc/profile.d/frost-prompt.sh"
     chmod 644 "${ROOTFS_DIR}/etc/profile.d/frost-prompt.sh"
 
-    # Install frost logo as icon for whisker menu
+    # ── Icons ──
     mkdir -p "${ROOTFS_DIR}/usr/share/icons/hicolor/128x128/apps"
     mkdir -p "${ROOTFS_DIR}/usr/share/icons/hicolor/scalable/apps"
-    cp "${SRC_DIR}/desktop/frost-logo.svg" \
-        "${ROOTFS_DIR}/usr/share/icons/hicolor/scalable/apps/frost-logo.svg"
-    # Copy PNG version if available
-    if [ -f "${ROOTFS_DIR}/usr/share/backgrounds/frost/frost-logo.png" ]; then
+    cp "${SRC_DIR}/desktop/frost-logo.svg" "${ROOTFS_DIR}/usr/share/icons/hicolor/scalable/apps/"
+    [ -f "${ROOTFS_DIR}/usr/share/backgrounds/frost/frost-logo.png" ] && \
         cp "${ROOTFS_DIR}/usr/share/backgrounds/frost/frost-logo.png" \
-            "${ROOTFS_DIR}/usr/share/icons/hicolor/128x128/apps/frost-logo.png"
-    fi
+           "${ROOTFS_DIR}/usr/share/icons/hicolor/128x128/apps/"
 
-    # Set correct ownership for frost user configs
-    chroot "${ROOTFS_DIR}" bash -c "
-        chown -R frost:frost /home/frost 2>/dev/null || true
-    "
+    # ── Fix ownership ──
+    chroot "${ROOTFS_DIR}" bash -c "chown -R frost:frost /home/frost 2>/dev/null || true"
 
-    # Clean up apt cache
+    # ── Clean apt cache ──
     chroot "${ROOTFS_DIR}" bash -c "
         apt-get clean
         rm -rf /var/cache/apt/archives/*.deb /tmp/* /var/tmp/*
     "
 
-    # Unmount chroot filesystems
-    umount "${ROOTFS_DIR}/tmp" 2>/dev/null || true
-    umount "${ROOTFS_DIR}/sys" 2>/dev/null || true
-    umount "${ROOTFS_DIR}/proc" 2>/dev/null || true
-    umount "${ROOTFS_DIR}/dev/pts" 2>/dev/null || true
-    umount "${ROOTFS_DIR}/dev" 2>/dev/null || true
-
-    ok "Desktop environment installed and themed"
+    ok "Desktop themed"
 }
 
 # =============================================================================
-# Step 2: Assemble x86-64 early init binary
+# Step 4: Assemble x86-64 early init binary
 # =============================================================================
 build_asm() {
-    log "Assembling x86-64 early init stub..."
-
+    log "Assembling early init stub..."
     local asm_src="${SRC_DIR}/boot/asm/early_init.asm"
-    local asm_obj="${BUILD_DIR}/early_init.o"
-    local asm_bin="${BUILD_DIR}/early_init"
-
-    [[ -f "${asm_src}" ]] || err "Assembly source not found: ${asm_src}"
-
-    # Assemble
-    nasm -f elf64 -o "${asm_obj}" "${asm_src}"
-
-    # Link (static, no libc)
-    ld -o "${asm_bin}" "${asm_obj}" --oformat=elf64-x86-64 -e _start --static
-
-    # Verify
-    file "${asm_bin}"
-    ok "Early init binary built ($(stat -c%s "${asm_bin}") bytes)"
+    [[ -f "${asm_src}" ]] || err "ASM source not found: ${asm_src}"
+    nasm -f elf64 -o "${BUILD_DIR}/early_init.o" "${asm_src}"
+    ld -o "${BUILD_DIR}/early_init" "${BUILD_DIR}/early_init.o" --oformat=elf64-x86-64 -e _start --static
+    ok "Early init built ($(stat -c%s "${BUILD_DIR}/early_init") bytes)"
 }
 
 # =============================================================================
-# Step 3: Build initramfs
+# Step 5: Build initramfs
 # =============================================================================
 build_initramfs() {
     log "Building initramfs..."
-
     rm -rf "${INITRAMFS_DIR}"
     mkdir -p "${INITRAMFS_DIR}"/{bin,sbin,usr/bin,usr/sbin,lib,lib64,dev,proc,sys,etc,run,tmp,frost}
 
-    # Copy busybox (static) for shell and basic utilities
+    # ── Busybox ──
     if command -v busybox >/dev/null 2>&1; then
         cp "$(command -v busybox)" "${INITRAMFS_DIR}/bin/busybox"
     elif [[ -f /bin/busybox ]]; then
         cp /bin/busybox "${INITRAMFS_DIR}/bin/busybox"
     else
-        # Install busybox-static
         apt-get install -y -qq busybox-static 2>/dev/null || true
-        cp /bin/busybox "${INITRAMFS_DIR}/bin/busybox" 2>/dev/null || \
-            err "Cannot find busybox. Install busybox-static."
+        cp /bin/busybox "${INITRAMFS_DIR}/bin/busybox" 2>/dev/null || err "No busybox found"
     fi
     chmod 755 "${INITRAMFS_DIR}/bin/busybox"
 
-    # Create busybox symlinks
+    # Busybox symlinks
     for cmd in sh ash mount umount mkdir cat echo ls cp mv rm ln chmod chown \
                mknod switch_root pivot_root sleep grep sed awk printf \
                mountpoint findfs blkid losetup readlink tr sort touch \
                rmdir basename dirname head tail cut mdev find uname wc; do
         ln -sf busybox "${INITRAMFS_DIR}/bin/${cmd}" 2>/dev/null || true
     done
-
-    # Also link in sbin
     for cmd in modprobe insmod switch_root pivot_root blkid; do
         ln -sf ../bin/busybox "${INITRAMFS_DIR}/sbin/${cmd}" 2>/dev/null || true
     done
 
-    # Copy the early_init binary
+    # ── Binaries ──
     cp "${BUILD_DIR}/early_init" "${INITRAMFS_DIR}/early_init"
     chmod 755 "${INITRAMFS_DIR}/early_init"
-
-    # Copy the init script (pure shell - no Python dependency in initramfs)
     cp "${SRC_DIR}/initramfs/init" "${INITRAMFS_DIR}/init"
     chmod 755 "${INITRAMFS_DIR}/init"
 
-    # Copy frost tools (installed into merged root during pivot)
+    # ── Python tools (copied into merged root during boot) ──
     cp "${SRC_DIR}/tools/frost-persist.py" "${INITRAMFS_DIR}/frost-persist.py"
     cp "${SRC_DIR}/tools/frost-overlay.py" "${INITRAMFS_DIR}/frost-overlay.py"
     cp "${SRC_DIR}/tools/frost-config.py"  "${INITRAMFS_DIR}/frost-config.py"
 
-    # Create device nodes
+    # ── Device nodes ──
     mknod -m 622 "${INITRAMFS_DIR}/dev/console" c 5 1 2>/dev/null || true
     mknod -m 666 "${INITRAMFS_DIR}/dev/null"    c 1 3 2>/dev/null || true
     mknod -m 666 "${INITRAMFS_DIR}/dev/zero"    c 1 5 2>/dev/null || true
     mknod -m 666 "${INITRAMFS_DIR}/dev/tty"     c 5 0 2>/dev/null || true
 
-    # Copy kernel modules needed for overlay and USB
+    # ── Kernel modules ──
     copy_kernel_modules
 
-    # Create the initramfs cpio archive
-    log "Creating initramfs cpio archive..."
+    # ── Pack cpio ──
+    log "Packing initramfs..."
     cd "${INITRAMFS_DIR}"
     find . | cpio -o -H newc 2>/dev/null | gzip -9 > "${BUILD_DIR}/initramfs.cpio.gz"
-
-    ok "Initramfs built ($(stat -c%s "${BUILD_DIR}/initramfs.cpio.gz") bytes)"
+    ok "Initramfs: $(du -h "${BUILD_DIR}/initramfs.cpio.gz" | cut -f1)"
 }
 
 # =============================================================================
-# Copy essential kernel modules (comprehensive - includes all dependencies)
+# Copy kernel modules for initramfs
 # =============================================================================
 copy_kernel_modules() {
-    log "Copying kernel modules..."
-
-    # Find kernel version
     local kver
     kver=$(ls "${ROOTFS_DIR}/lib/modules/" | head -1)
-
-    if [[ -z "${kver}" ]]; then
-        warn "No kernel modules found, skipping"
-        return
-    fi
+    [[ -z "${kver}" ]] && { warn "No kernel modules found"; return; }
 
     local mod_src="${ROOTFS_DIR}/lib/modules/${kver}"
     local mod_dst="${INITRAMFS_DIR}/lib/modules/${kver}"
     mkdir -p "${mod_dst}"
 
-    # Copy entire driver subsystem directories (ensures all dependencies are met)
+    # Copy driver directories needed for early boot
     for subdir in drivers/ata drivers/scsi drivers/virtio drivers/block \
-                  drivers/usb/storage drivers/usb/host drivers/usb/core \
+                  drivers/usb/common drivers/usb/storage drivers/usb/host drivers/usb/core \
                   drivers/hid \
                   drivers/gpu/drm/bochs drivers/gpu/drm/virtio \
                   drivers/gpu/drm/simpledrm drivers/gpu/drm/tiny \
                   fs/overlayfs fs/squashfs fs/ext4 fs/fat fs/nls fs/jbd2 \
                   block lib crypto arch/x86/crypto; do
-        local src_path="${mod_src}/kernel/${subdir}"
-        if [[ -d "$src_path" ]]; then
-            local dst_path="${mod_dst}/kernel/${subdir}"
-            mkdir -p "$dst_path"
-            cp -r "${src_path}"/* "$dst_path/" 2>/dev/null || true
+        if [[ -d "${mod_src}/kernel/${subdir}" ]]; then
+            mkdir -p "${mod_dst}/kernel/${subdir}"
+            cp -r "${mod_src}/kernel/${subdir}"/* "${mod_dst}/kernel/${subdir}/" 2>/dev/null || true
         fi
     done
 
-    # Also copy key individual modules (in case they're outside the above dirs)
-    for mod_pattern in "overlay.ko*" "squashfs.ko*" "loop.ko*" "virtio*.ko*" \
-                       "libata.ko*" "ata_piix.ko*" "ahci.ko*" "sd_mod.ko*" \
-                       "scsi_mod.ko*" "ata_generic.ko*" "libahci.ko*" \
-                       "mbcache.ko*" "jbd2.ko*" "ext4.ko*" "crc*.ko*" \
-                       "t10-pi.ko*" "crct10dif*.ko*" "crc-t10dif.ko*" \
-                       "crc32c_generic.ko*" "crc64_rocksoft.ko*" \
-                       "usb-common.ko*" "usbcore.ko*" "usb-storage.ko*" \
-                       "xhci*.ko*" "ehci*.ko*" \
-                       "hid.ko*" "usbhid.ko*" "hid-generic.ko*" \
-                       "nls_*.ko*" "fat.ko*" "vfat.ko*" \
-                       "drm.ko*" "drm_kms_helper.ko*" "bochs*.ko*" \
-                       "virtio-gpu.ko*" "simpledrm.ko*"; do
-        find "${mod_src}" -name "${mod_pattern}" 2>/dev/null | while read mod_file; do
-            local rel_path="${mod_file#${mod_src}/}"
-            local dest_dir="${mod_dst}/$(dirname "$rel_path")"
-            mkdir -p "$dest_dir"
-            cp "$mod_file" "$dest_dir/" 2>/dev/null || true
+    # Individual modules that may live elsewhere
+    for pat in "overlay.ko*" "squashfs.ko*" "loop.ko*" "virtio*.ko*" \
+               "libata.ko*" "ahci.ko*" "sd_mod.ko*" "scsi_mod.ko*" \
+               "ext4.ko*" "jbd2.ko*" "crc*.ko*" "mbcache.ko*" \
+               "drm.ko*" "drm_kms_helper.ko*" "simpledrm.ko*"; do
+        find "${mod_src}" -name "${pat}" 2>/dev/null | while read -r f; do
+            local rel="${f#${mod_src}/}"
+            local d="${mod_dst}/$(dirname "$rel")"
+            mkdir -p "$d"
+            cp "$f" "$d/" 2>/dev/null || true
         done
     done
 
-    # Copy modules.dep and related metadata files
     cp "${mod_src}/modules."* "${mod_dst}/" 2>/dev/null || true
-
-    # Regenerate modules.dep for our subset
     depmod -b "${INITRAMFS_DIR}" "${kver}" 2>/dev/null || true
 
-    local mod_count
-    mod_count=$(find "${mod_dst}" -name '*.ko*' 2>/dev/null | wc -l)
-    ok "Kernel modules copied for ${kver} (${mod_count} modules)"
+    local cnt
+    cnt=$(find "${mod_dst}" -name '*.ko*' 2>/dev/null | wc -l)
+    ok "${cnt} kernel modules for ${kver}"
 }
 
 # =============================================================================
-# Step 4: Create the disk image
+# Step 6: Create the disk image
 # =============================================================================
 build_image() {
     log "Creating disk image (${IMAGE_SIZE_MB}MB)..."
-
-    # Create sparse image file
     dd if=/dev/zero of="${IMAGE_FILE}" bs=1M count=0 seek="${IMAGE_SIZE_MB}" 2>/dev/null
 
-    # Partition the image
-    # Partition 1: EFI System Partition (FAT32)
-    # Partition 2: Root filesystem (squashfs)
-    # Partition 3: Persistence (ext4)
     parted -s "${IMAGE_FILE}" \
         mklabel gpt \
         mkpart "EFI" fat32 1MiB ${EFI_SIZE_MB}MiB \
@@ -610,140 +875,94 @@ build_image() {
         mkpart "FROST_ROOT" ext4 ${EFI_SIZE_MB}MiB $((EFI_SIZE_MB + ROOT_SIZE_MB))MiB \
         mkpart "FROST_PERSIST" ext4 $((EFI_SIZE_MB + ROOT_SIZE_MB))MiB 100%
 
-    ok "Partition table created"
-
-    # Set up loop device
     local loop_dev
     loop_dev=$(losetup --show -fP "${IMAGE_FILE}")
-    log "Loop device: ${loop_dev}"
+    sleep 1; partprobe "${loop_dev}" 2>/dev/null || true; sleep 1
 
-    # Wait for partition devices to appear
-    sleep 1
-    partprobe "${loop_dev}" 2>/dev/null || true
-    sleep 1
-
-    # Format partitions
-    log "Formatting partitions..."
     mkfs.fat -F32 -n "EFI" "${loop_dev}p1"
     mkfs.ext4 -L "FROST_ROOT" -q "${loop_dev}p2"
     mkfs.ext4 -L "FROST_PERSIST" -q "${loop_dev}p3"
 
-    # Mount and populate partitions
     local mnt="${BUILD_DIR}/mnt"
     mkdir -p "${mnt}"/{efi,root,persist}
 
-    # === EFI Partition ===
+    # ── EFI partition ──
     mount "${loop_dev}p1" "${mnt}/efi"
     populate_efi "${mnt}/efi" "${loop_dev}"
 
-    # === Root Partition ===
+    # ── Root partition (squashfs) ──
     mount "${loop_dev}p2" "${mnt}/root"
     populate_root "${mnt}/root"
 
-    # === Persistence Partition ===
+    # ── Persistence partition ──
     mount "${loop_dev}p3" "${mnt}/persist"
     populate_persist "${mnt}/persist"
 
-    # Unmount everything
     sync
-    umount "${mnt}/persist"
-    umount "${mnt}/root"
-    umount "${mnt}/efi"
-
-    # Detach loop device
+    umount "${mnt}/persist" "${mnt}/root" "${mnt}/efi"
     losetup -d "${loop_dev}"
 
-    ok "Disk image created: ${IMAGE_FILE} ($(du -h "${IMAGE_FILE}" | cut -f1))"
+    ok "Image: ${IMAGE_FILE} ($(du -h "${IMAGE_FILE}" | cut -f1))"
 }
 
 # =============================================================================
 # Populate EFI partition
 # =============================================================================
 populate_efi() {
-    local efi_dir="$1"
-    local loop_dev="$2"
+    local efi_dir="$1" loop_dev="$2"
+    local vmlinuz
 
-    log "Populating EFI partition..."
-
-    # Find kernel and initramfs
-    local kver
-    kver=$(ls "${ROOTFS_DIR}/lib/modules/" | head -1)
-
-    local vmlinuz="${ROOTFS_DIR}/boot/vmlinuz-${kver}"
-    if [[ ! -f "${vmlinuz}" ]]; then
-        vmlinuz=$(find "${ROOTFS_DIR}/boot" -name 'vmlinuz-*' | head -1)
+    # Kernel was saved to build dir by strip_bloat, or is still in rootfs
+    if [[ -f "${BUILD_DIR}/vmlinuz" ]]; then
+        vmlinuz="${BUILD_DIR}/vmlinuz"
+    else
+        local kver
+        kver=$(ls "${ROOTFS_DIR}/lib/modules/" | head -1)
+        vmlinuz="${ROOTFS_DIR}/boot/vmlinuz-${kver}"
+        [[ -f "${vmlinuz}" ]] || vmlinuz=$(find "${ROOTFS_DIR}/boot" -name 'vmlinuz-*' | head -1)
     fi
     [[ -f "${vmlinuz}" ]] || err "Kernel not found"
 
-    # Create directory structure
-    mkdir -p "${efi_dir}/EFI/BOOT"
-    mkdir -p "${efi_dir}/boot/grub"
-
-    # Copy kernel
+    mkdir -p "${efi_dir}/EFI/BOOT" "${efi_dir}/boot/grub"
     cp "${vmlinuz}" "${efi_dir}/boot/vmlinuz"
-
-    # Copy our custom initramfs
     cp "${BUILD_DIR}/initramfs.cpio.gz" "${efi_dir}/boot/initramfs.img"
 
-    # Install GRUB for EFI
     grub-mkimage \
         -o "${efi_dir}/EFI/BOOT/BOOTX64.EFI" \
-        -O x86_64-efi \
-        -p /boot/grub \
+        -O x86_64-efi -p /boot/grub \
         part_gpt part_msdos fat ext2 normal boot linux \
         configfile loopback chain efifwsetup efi_gop \
         efi_uga ls search search_label search_fs_uuid \
         search_fs_file gfxterm gfxterm_background \
         gfxterm_menu test all_video loadenv echo
 
-    # Install GRUB for BIOS too (hybrid boot)
-    if command -v grub-install >/dev/null 2>&1; then
-        grub-install \
-            --target=i386-pc \
-            --boot-directory="${efi_dir}/boot" \
-            --modules="part_gpt part_msdos fat ext2 normal boot linux configfile search search_label" \
-            "${loop_dev}" 2>/dev/null || warn "BIOS GRUB install failed (EFI only)"
-    fi
+    grub-install --target=i386-pc --boot-directory="${efi_dir}/boot" \
+        --modules="part_gpt part_msdos fat ext2 normal boot linux configfile search search_label" \
+        "${loop_dev}" 2>/dev/null || warn "BIOS GRUB failed (EFI-only)"
 
-    # Write GRUB config
     cat > "${efi_dir}/boot/grub/grub.cfg" << 'GRUBCFG'
 set timeout=3
 set default=0
-
-serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1
-terminal_input serial console
-terminal_output serial console
-
-# frOSt color scheme - icy cyan on dark
 set color_normal=cyan/black
 set color_highlight=white/blue
-set menu_color_normal=cyan/black
-set menu_color_highlight=white/blue
-
-echo ""
-echo "  ╔═══════════════════════════════════════╗"
-echo "  ║   frOSt - Frozen Operating System     ║"
-echo "  ║   Overlay Filesystem + Persistence    ║"
-echo "  ╚═══════════════════════════════════════╝"
-echo ""
 
 menuentry "frOSt Desktop" {
-    linux /boot/vmlinuz root=LABEL=FROST_ROOT ro quiet splash console=tty0 console=ttyS0,115200
+    linux /boot/vmlinuz root=LABEL=FROST_ROOT ro quiet splash
     initrd /boot/initramfs.img
 }
 
-menuentry "frOSt Console (Text Mode)" {
-    linux /boot/vmlinuz root=LABEL=FROST_ROOT ro quiet console=tty0 console=ttyS0,115200 systemd.unit=multi-user.target
+menuentry "frOSt Console" {
+    linux /boot/vmlinuz root=LABEL=FROST_ROOT ro quiet systemd.unit=multi-user.target
     initrd /boot/initramfs.img
 }
 
-menuentry "frOSt (Recovery Mode)" {
-    linux /boot/vmlinuz root=LABEL=FROST_ROOT ro single console=tty0 console=ttyS0,115200
+menuentry "frOSt Recovery" {
+    linux /boot/vmlinuz root=LABEL=FROST_ROOT ro single
     initrd /boot/initramfs.img
 }
 
-menuentry "frOSt (Debug - Verbose Boot)" {
-    linux /boot/vmlinuz root=LABEL=FROST_ROOT ro debug loglevel=7 console=tty0 console=ttyS0,115200
+menuentry "frOSt Debug" {
+    linux /boot/vmlinuz root=LABEL=FROST_ROOT ro debug loglevel=7
     initrd /boot/initramfs.img
 }
 GRUBCFG
@@ -752,42 +971,27 @@ GRUBCFG
 }
 
 # =============================================================================
-# Populate root partition (squashfs or direct copy)
+# Populate root partition (squashfs)
 # =============================================================================
 populate_root() {
     local root_dir="$1"
-
-    log "Populating root partition..."
-
-    # Try to create squashfs
-    if command -v mksquashfs >/dev/null 2>&1; then
-        log "Creating squashfs image..."
-        mksquashfs "${ROOTFS_DIR}" "${root_dir}/rootfs.squashfs" \
-            -comp xz -no-xattrs -quiet 2>/dev/null || \
-        mksquashfs "${ROOTFS_DIR}" "${root_dir}/rootfs.squashfs" \
-            -comp gzip -no-xattrs -quiet
-
-        ok "Squashfs created ($(du -h "${root_dir}/rootfs.squashfs" | cut -f1))"
-    else
-        # Fallback: copy rootfs directly
-        log "Squashfs unavailable, copying rootfs directly..."
-        cp -a "${ROOTFS_DIR}"/* "${root_dir}/"
-        ok "Rootfs copied directly"
-    fi
+    log "Creating squashfs..."
+    mksquashfs "${ROOTFS_DIR}" "${root_dir}/rootfs.squashfs" \
+        -comp xz -Xdict-size 100% -Xbcj x86 -b 1M -no-xattrs -quiet 2>/dev/null || \
+    mksquashfs "${ROOTFS_DIR}" "${root_dir}/rootfs.squashfs" \
+        -comp xz -no-xattrs -quiet 2>/dev/null || \
+    mksquashfs "${ROOTFS_DIR}" "${root_dir}/rootfs.squashfs" \
+        -comp gzip -no-xattrs -quiet
+    ok "Squashfs: $(du -h "${root_dir}/rootfs.squashfs" | cut -f1)"
 }
 
 # =============================================================================
-# Populate persistence partition with default config
+# Populate persistence partition
 # =============================================================================
 populate_persist() {
     local persist_dir="$1"
-
-    log "Setting up persistence partition..."
-
     mkdir -p "${persist_dir}/data"
-
-    # Write default persistence config
-    cat > "${persist_dir}/frost-persist.json" << 'PERSISTCFG'
+    cat > "${persist_dir}/frost-persist.json" << 'EOF'
 {
   "version": 1,
   "persistent_paths": [
@@ -807,9 +1011,8 @@ populate_persist() {
     "persist_tmp": false
   }
 }
-PERSISTCFG
-
-    ok "Persistence partition initialized"
+EOF
+    ok "Persistence initialized"
 }
 
 # =============================================================================
@@ -827,29 +1030,30 @@ main() {
     echo "================================="
     echo ""
 
-    # Clean previous build
     rm -rf "${BUILD_DIR}"
     mkdir -p "${BUILD_DIR}"
 
     preflight
     build_rootfs
     install_desktop
+    strip_bloat
     build_asm
     build_initramfs
     build_image
 
+    # Copy to Windows filesystem if running in WSL
+    if [ -d "/mnt/c/Users/thoma/Documents/frOSt" ]; then
+        log "Copying image to Windows filesystem..."
+        cp "${IMAGE_FILE}" "/mnt/c/Users/thoma/Documents/frOSt/frost.img"
+        ok "Image copied to Windows"
+    fi
+
     echo ""
-    echo -e "${GREEN}============================================="
-    echo " frOSt build complete!"
-    echo " Image: ${IMAGE_FILE}"
-    echo " Size:  $(du -h "${IMAGE_FILE}" | cut -f1)"
-    echo ""
-    echo " To test with QEMU:"
-    echo "   bash test.sh desktop    # Desktop mode (recommended)"
-    echo "   bash test.sh bios       # BIOS text mode"
-    echo "   bash test.sh uefi       # UEFI mode"
-    echo "=============================================${RESET}"
+    echo -e "${GREEN}═══════════════════════════════════════════${RESET}"
+    echo -e "${GREEN} frOSt build complete!${RESET}"
+    echo -e "${GREEN} Image: ${IMAGE_FILE}${RESET}"
+    echo -e "${GREEN} Size:  $(du -h "${IMAGE_FILE}" | cut -f1)${RESET}"
+    echo -e "${GREEN}═══════════════════════════════════════════${RESET}"
 }
 
-# Run main
 main "$@"

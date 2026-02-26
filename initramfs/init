@@ -20,6 +20,19 @@ export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
 echo "[frOSt] Starting initramfs init..."
 
+# Helper: calculate tmpfs size as 50% of RAM (minimum 512M)
+calc_tmpfs_size() {
+    local memtotal_kb
+    memtotal_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    if [ -n "$memtotal_kb" ] && [ "$memtotal_kb" -gt 0 ] 2>/dev/null; then
+        local half_mb=$(( memtotal_kb / 2 / 1024 ))
+        [ "$half_mb" -lt 512 ] && half_mb=512
+        echo "${half_mb}M"
+    else
+        echo "512M"
+    fi
+}
+
 # ---- Step 1: Early hardware init (assembly) ----
 if [ -x /early_init ]; then
     /early_init
@@ -31,7 +44,9 @@ if [ -x /early_init ]; then
         mount -t sysfs sysfs /sys 2>/dev/null || true
         mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
         mkdir -p /frost/lower /frost/upper /frost/work /frost/merged /frost/persist
-        mount -t tmpfs -o size=256M tmpfs /frost/upper
+        TMPFS_SIZE=$(calc_tmpfs_size)
+        echo "[frOSt] Tmpfs overlay size: ${TMPFS_SIZE}"
+        mount -t tmpfs -o "size=${TMPFS_SIZE}" tmpfs /frost/upper
     fi
 else
     echo "[frOSt] WARNING: /early_init not found, using shell fallback"
@@ -40,7 +55,9 @@ else
     mount -t sysfs sysfs /sys
     mount -t devtmpfs devtmpfs /dev
     mkdir -p /frost/lower /frost/upper /frost/work /frost/merged /frost/persist
-    mount -t tmpfs -o size=256M tmpfs /frost/upper
+    TMPFS_SIZE=$(calc_tmpfs_size)
+    echo "[frOSt] Tmpfs overlay size: ${TMPFS_SIZE}"
+    mount -t tmpfs -o "size=${TMPFS_SIZE}" tmpfs /frost/upper
 fi
 
 # ---- Step 2: Load required kernel modules ----
@@ -97,80 +114,150 @@ if [ -f /proc/sys/kernel/hotplug ]; then
     echo /bin/mdev > /proc/sys/kernel/hotplug
 fi
 mdev -s 2>/dev/null || true
-sleep 2
 
-# Debug: show what's in /sys/block
-echo "[frOSt] /sys/block contents:"
-ls /sys/block/ 2>/dev/null || echo "  (empty)"
+# Retrigger uevents so mdev picks up all devices including USB
+# This is critical on real hardware where USB enumeration is async
+echo "[frOSt] Triggering device uevents..."
+if [ -d /sys/bus ]; then
+    for uevent in /sys/bus/usb/devices/*/uevent /sys/bus/scsi/devices/*/uevent /sys/bus/pci/devices/*/uevent; do
+        [ -f "$uevent" ] && echo "add" > "$uevent" 2>/dev/null || true
+    done
+fi
+
+# Wait for USB devices to enumerate - real hardware needs 3-5 seconds
+echo "[frOSt] Waiting for USB device enumeration..."
+sleep 3
+mdev -s 2>/dev/null || true
 
 # ---- Step 3: Find frOSt partitions ----
 echo "[frOSt] Searching for frOSt partitions..."
-echo "[frOSt] All /dev block devices:"
-ls -la /dev/[shv]d* /dev/mmcblk* /dev/nvme* 2>/dev/null || echo "  (none found)"
+
+# Ensure all block device nodes exist by scanning /sys/block
+# mdev doesn't always create all partition nodes reliably
+ensure_dev_nodes() {
+    for sysblk in /sys/block/*; do
+        bname=$(basename "$sysblk")
+        # Skip loop/ram devices
+        case "$bname" in loop*|ram*) continue ;; esac
+
+        majmin=$(cat "$sysblk/dev" 2>/dev/null) || continue
+        maj="${majmin%%:*}"
+        min="${majmin##*:}"
+
+        # Create base device node if missing
+        [ -b "/dev/$bname" ] || mknod "/dev/$bname" b "$maj" "$min" 2>/dev/null || true
+
+        # Create partition nodes
+        for part in "$sysblk/$bname"*/dev; do
+            [ -f "$part" ] || continue
+            pname=$(basename "$(dirname "$part")")
+            pmajmin=$(cat "$part" 2>/dev/null) || continue
+            pmaj="${pmajmin%%:*}"
+            pmin="${pmajmin##*:}"
+            [ -b "/dev/$pname" ] || mknod "/dev/$pname" b "$pmaj" "$pmin" 2>/dev/null || true
+        done
+    done
+}
+
+echo "[frOSt] /sys/block contents:"
+ls /sys/block/ 2>/dev/null || echo "  (empty)"
+
 ROOT_DEV=""
 PERSIST_DEV=""
 
-# Wait for devices to appear (up to 10 seconds)
+# Wait for devices to appear (up to 30 seconds - real USB can be slow)
 TRIES=0
-while [ $TRIES -lt 20 ]; do
-    # Re-scan devices
+MAX_TRIES=30
+while [ $TRIES -lt $MAX_TRIES ]; do
+    # Re-trigger mdev scan and ensure device nodes exist
     mdev -s 2>/dev/null || true
+    ensure_dev_nodes
 
-    # Method 1: Check by label
+    # Log every 5th attempt to avoid spam
+    if [ $((TRIES % 5)) -eq 0 ]; then
+        echo "[frOSt] Scan $TRIES/$MAX_TRIES - /sys/block:"
+        ls /sys/block/ 2>/dev/null | tr '\n' ' '
+        echo ""
+        echo "[frOSt]   /dev devices:"
+        ls /dev/[shv]d* /dev/hd* /dev/mmcblk* /dev/nvme* 2>/dev/null || echo "    (none yet)"
+    fi
+
+    # Method 1: findfs (busybox built-in, scans all /dev block devices)
+    ROOT_DEV=$(findfs LABEL=FROST_ROOT 2>/dev/null) || true
+    if [ -n "$ROOT_DEV" ]; then
+        echo "[frOSt] Found FROST_ROOT: $ROOT_DEV (findfs)"
+        PERSIST_DEV=$(findfs LABEL=FROST_PERSIST 2>/dev/null) || true
+        break
+    fi
+
+    # Method 2: /dev/disk/by-label (udev creates these)
     if [ -e /dev/disk/by-label/FROST_ROOT ]; then
         ROOT_DEV=$(readlink -f /dev/disk/by-label/FROST_ROOT)
-        echo "[frOSt] Found FROST_ROOT: $ROOT_DEV"
-        if [ -e /dev/disk/by-label/FROST_PERSIST ]; then
+        echo "[frOSt] Found FROST_ROOT via by-label: $ROOT_DEV"
+        [ -e /dev/disk/by-label/FROST_PERSIST ] && \
             PERSIST_DEV=$(readlink -f /dev/disk/by-label/FROST_PERSIST)
-        fi
         break
     fi
 
-    # Method 2: Use blkid to find labeled partitions
-    BLKID_OUT=$(blkid 2>/dev/null || true)
-    if echo "$BLKID_OUT" | grep -q "FROST_ROOT"; then
-        ROOT_DEV=$(echo "$BLKID_OUT" | grep "FROST_ROOT" | cut -d: -f1)
-        PERSIST_DEV=$(echo "$BLKID_OUT" | grep "FROST_PERSIST" | cut -d: -f1)
-        echo "[frOSt] Found via blkid: ROOT=$ROOT_DEV"
-        break
-    fi
+    # Method 3: Probe partition 2 of each disk for rootfs.squashfs
+    for sysblk in /sys/block/sd* /sys/block/vd* /sys/block/hd* /sys/block/mmcblk* /sys/block/nvme*; do
+        [ -d "$sysblk" ] || continue
+        bname=$(basename "$sysblk")
 
-    # Method 3: Scan for block devices with partitions
-    for base in /dev/vda /dev/sda /dev/sdb /dev/sdc /dev/hda; do
-        if [ -b "${base}2" ]; then
-            ROOT_DEV="${base}2"
-            PERSIST_DEV="${base}3"
-            echo "[frOSt] Found device: $base"
-            break 2
-        fi
-        # Also try checking base device exists and look for partition scheme
-        if [ -b "${base}" ]; then
-            # The partitions might just not have nodes yet - try to read partition table
-            echo "[frOSt] Found base device ${base}, checking partitions..."
-            # Try to create partition nodes manually
-            if [ -f "/sys/block/$(basename ${base})/$(basename ${base})2/size" ]; then
-                MAJOR=$(cat "/sys/block/$(basename ${base})/dev" | cut -d: -f1)
-                MINOR2=$(cat "/sys/block/$(basename ${base})/$(basename ${base})2/dev" | cut -d: -f2)
-                MINOR3=$(cat "/sys/block/$(basename ${base})/$(basename ${base})3/dev" 2>/dev/null | cut -d: -f2)
-                mknod "${base}2" b "$MAJOR" "$MINOR2" 2>/dev/null || true
-                [ -n "$MINOR3" ] && mknod "${base}3" b "$MAJOR" "$MINOR3" 2>/dev/null || true
-                ROOT_DEV="${base}2"
-                PERSIST_DEV="${base}3"
-                echo "[frOSt] Created partition nodes for $base"
-                break 2
+        p2dev=""
+        case "$bname" in
+            sd*|vd*|hd*) p2dev="/dev/${bname}2" ;;
+            mmcblk*|nvme*) p2dev="/dev/${bname}p2" ;;
+        esac
+
+        if [ -b "$p2dev" ]; then
+            mkdir -p /frost/probe
+            if mount -o ro "$p2dev" /frost/probe 2>/dev/null; then
+                if [ -f /frost/probe/rootfs.squashfs ]; then
+                    umount /frost/probe
+                    ROOT_DEV="$p2dev"
+                    case "$bname" in
+                        sd*|vd*|hd*) PERSIST_DEV="/dev/${bname}3" ;;
+                        mmcblk*|nvme*) PERSIST_DEV="/dev/${bname}p3" ;;
+                    esac
+                    echo "[frOSt] Found frOSt root by probing: $ROOT_DEV"
+                    break 2
+                fi
+                umount /frost/probe
             fi
         fi
     done
 
     TRIES=$((TRIES + 1))
-    sleep 0.5
+    sleep 1
 done
 
 if [ -z "$ROOT_DEV" ]; then
-    echo "[frOSt] FATAL: No frOSt device found!"
-    echo "[frOSt] Available block devices:"
-    ls /dev/sd* /dev/vd* /dev/loop* 2>/dev/null || true
+    echo ""
+    echo "[frOSt] ============================================"
+    echo "[frOSt] FATAL: No frOSt device found after $TRIES seconds!"
+    echo "[frOSt] ============================================"
+    echo ""
+    echo "[frOSt] --- /sys/block ---"
+    ls -la /sys/block/ 2>/dev/null || echo "    (empty)"
+    echo ""
+    echo "[frOSt] --- /dev block devices ---"
+    ls -la /dev/[shv]d* /dev/mmcblk* /dev/nvme* /dev/hd* /dev/vd* 2>/dev/null || echo "    (none)"
+    echo ""
+    echo "[frOSt] --- /proc/partitions ---"
+    cat /proc/partitions 2>/dev/null || echo "    (failed)"
+    echo ""
+    echo "[frOSt] --- Loaded modules ---"
+    cat /proc/modules 2>/dev/null | awk '{print "  "$1}' | head -30
+    echo ""
+    echo "[frOSt] --- dmesg (USB/SCSI/block related) ---"
+    dmesg 2>/dev/null | grep -iE "usb|scsi|sd[a-z]|block|storage|xhci|ehci|error|fail" | tail -40
+    echo ""
+    echo "[frOSt] --- Full dmesg (last 50 lines) ---"
+    dmesg 2>/dev/null | tail -50
+    echo ""
     echo "[frOSt] Dropping to emergency shell..."
+    echo "[frOSt] Debug: try 'cat /proc/partitions' and 'ls /sys/block/'"
     exec /bin/sh
 fi
 
