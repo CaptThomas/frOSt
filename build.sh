@@ -1,16 +1,19 @@
 #!/bin/bash
 # =============================================================================
-# frOSt Build System v2.0
+# frOSt Build System v3.0
 # =============================================================================
 # Builds a complete frOSt bootable USB disk image:
 #   1. Creates a Debian rootfs via debootstrap (with all packages)
 #   2. Configures system (users, networking, NTP, hardware detection, browser)
 #   3. Installs desktop environment (XFCE4 + picom + theming)
-#   4. Assembles the x86-64 early init binary
-#   5. Builds the initramfs (asm stub + shell init + busybox + modules)
-#   6. Creates a partitioned disk image with GRUB
+#   4. Assembles the x86-64 early init binary (bare-metal asm)
+#   5. Compiles the Python init to standalone binary (Nuitka)
+#   6. Builds the initramfs (asm + shell bootstrap + Python init + busybox + modules)
+#   7. Creates a partitioned disk image with GRUB
 #
-# All fixes from incremental fix scripts are integrated here.
+# Init system: x86-64 assembly early_init -> shell bootstrap -> Python frost_init (from squashfs)
+# USB removal triggers automatic clean shutdown via frost-usb-watchdog
+#
 # This is the single source of truth for the build.
 #
 # Requirements: debootstrap, nasm, grub, mtools, squashfs-tools, python3
@@ -20,7 +23,7 @@
 set -euo pipefail
 
 # ─── Configuration ───────────────────────────────────────────────────────────
-FROST_VERSION="2.0.0"
+FROST_VERSION="3.0.0"
 BUILD_DIR="/root/frost-build"
 ROOTFS_DIR="${BUILD_DIR}/rootfs"
 INITRAMFS_DIR="${BUILD_DIR}/initramfs"
@@ -222,25 +225,63 @@ EOF
         echo 'UTC' > /etc/timezone
     "
 
+    # ── OS Branding ──
+    cat > "${ROOTFS_DIR}/etc/os-release" << EOF
+PRETTY_NAME="frOSt ${FROST_VERSION} (Frozen Operating System)"
+NAME="frOSt"
+VERSION_ID="${FROST_VERSION}"
+VERSION="${FROST_VERSION}"
+ID=frost
+ID_LIKE=debian
+HOME_URL="https://github.com/frost-os"
+BUG_REPORT_URL="https://github.com/frost-os/issues"
+VARIANT="Desktop"
+VARIANT_ID=desktop
+EOF
+
+    cat > "${ROOTFS_DIR}/etc/lsb-release" << EOF
+DISTRIB_ID=frOSt
+DISTRIB_RELEASE=${FROST_VERSION}
+DISTRIB_CODENAME=frost
+DISTRIB_DESCRIPTION="frOSt ${FROST_VERSION} (Frozen Operating System)"
+EOF
+
+    # /etc/issue - shown before login prompt
+    cat > "${ROOTFS_DIR}/etc/issue" << 'EOF'
+
+\e[1;36m  :::::::::: :::::::::   ::::::::   ::::::::  ::::::::::\e[0m
+\e[1;36m  :+:        :+:    :+: :+:    :+: :+:    :+:    :+:   \e[0m
+\e[1;36m  +:+        +:+    +:+ +:+    +:+ +:+           +:+   \e[0m
+\e[1;36m  :#::+::#   +#++:++#:  +#+    +:+ +#++:++#++    +#+   \e[0m
+\e[1;36m  +#+        +#+    +#+ +#+    +#+        +#+    +#+    \e[0m
+\e[1;36m  #+#        #+#    #+# #+#    #+# #+#    #+#    #+#    \e[0m
+\e[1;36m  ###        ###    ###  ########   ########     ###    \e[0m
+\e[0m
+\e[0;37m  Frozen Operating System\e[0m
+\e[0;90m  \n (\l)\e[0m
+
+EOF
+
+    cat > "${ROOTFS_DIR}/etc/issue.net" << 'EOF'
+frOSt - Frozen Operating System
+EOF
+
     # ── MOTD ──
     cat > "${ROOTFS_DIR}/etc/motd" << 'EOF'
 
-  [0;36m     *        [0m
-  [0;36m    /|\       [0m  [1;37m__       ___  ____  _   [0m
-  [0;36m   / | \      [0m [0;37m/ _|_ __ / _ \/ ___|| |_ [0m
-  [0;36m--/  |  \--   [0m[0;37m| |_| '__| | | \___ \| __|[0m
-  [0;36m\  | /  \  [0m[0;37m|  _| |  | |_| |___) | |_ [0m
-  [0;36m*---\-|-/---* [0m[0;37m|_| |_|   \___/|____/ \__|[0m
-  [0;36m \  / \|/ \ / [0m
-  [0;36m  \/   *   \/ [0m [1;36mFrozen Operating System v2.0[0m
-  [0;36m  /\  /|\  /\ [0m [0;36mOverlay: [0;32mACTIVE[0m  [0;36mPersist: [0;32mON[0m
-  [0;36m /  \/ | \/  \[0m
-  [0;36m       *      [0m [0;90mAll changes are transient unless persisted.[0m
+  [1;34m┌──────────────────────────────────────────────┐[0m
+  [1;34m│[1;36m  ❄  frOSt - Frozen Operating System  ❄      [1;34m│[0m
+  [1;34m└──────────────────────────────────────────────┘[0m
 
-  [1;36mQuick commands:[0m
+  [1;37mfrOSt v3.0[0m  [0;90m|[0m  [0;36mInit: [0;32masm + python[0m  [0;90m|[0m  [0;36mOverlay: [0;32mACTIVE[0m  [0;90m|[0m  [0;36mPersist: [0;32mON[0m
+  [0;90mAll changes are transient unless persisted.[0m
+  [1;33m⚡ USB watchdog active — pull USB to shutdown cleanly[0m
+
+  [1;36mCommands:[0m
     [0;36mfrost-persist list[0m        - See persistent paths
     [0;36mfrost-persist add <path>[0m  - Persist a path
     [0;36mfrost-overlay status[0m      - Overlay info
+    [0;36mfrost-wifi-diag[0m           - WiFi diagnostics
 
 EOF
 
@@ -362,6 +403,13 @@ install_frost_tools() {
         fi
     done
 
+    # USB watchdog daemon
+    cp "${SRC_DIR}/tools/frost-usb-watchdog.py" "${bindir}/frost-usb-watchdog"
+    chmod 755 "${bindir}/frost-usb-watchdog"
+    if ! head -1 "${bindir}/frost-usb-watchdog" | grep -q '^#!'; then
+        sed -i '1i#!/usr/bin/env python3' "${bindir}/frost-usb-watchdog"
+    fi
+
     local sbindir="${ROOTFS_DIR}/usr/local/sbin"
     mkdir -p "${sbindir}"
     cp "${SRC_DIR}/tools/frost-expand-persist.sh" "${sbindir}/frost-expand-persist"
@@ -418,6 +466,25 @@ EOF
     # ── Boot diagnostics ──
     install_boot_diag
 
+    # ── USB watchdog (shutdown on USB removal) ──
+    cat > "${ROOTFS_DIR}/etc/systemd/system/frost-usb-watchdog.service" << 'EOF'
+[Unit]
+Description=frOSt USB Removal Watchdog
+After=multi-user.target
+Wants=frost-hwdetect.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frost-usb-watchdog
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
     # Enable all services
     mount_chroot
     chroot "${ROOTFS_DIR}" bash -c "
@@ -425,6 +492,7 @@ EOF
         systemctl enable frost-expand-persist.service 2>/dev/null || true
         systemctl enable frost-hwdetect.service 2>/dev/null || true
         systemctl enable frost-boot-diag.service 2>/dev/null || true
+        systemctl enable frost-usb-watchdog.service 2>/dev/null || true
         systemctl enable systemd-timesyncd.service 2>/dev/null || true
         systemctl enable lightdm 2>/dev/null || true
         systemctl enable NetworkManager.service 2>/dev/null || true
@@ -754,6 +822,7 @@ build_asm() {
     [[ -f "${asm_src}" ]] || err "ASM source not found: ${asm_src}"
     nasm -f elf64 -o "${BUILD_DIR}/early_init.o" "${asm_src}"
     ld -o "${BUILD_DIR}/early_init" "${BUILD_DIR}/early_init.o" --oformat=elf64-x86-64 -e _start --static
+    strip --strip-all "${BUILD_DIR}/early_init" 2>/dev/null || true
     ok "Early init built ($(stat -c%s "${BUILD_DIR}/early_init") bytes)"
 }
 
@@ -787,9 +856,18 @@ build_initramfs() {
         ln -sf ../bin/busybox "${INITRAMFS_DIR}/sbin/${cmd}" 2>/dev/null || true
     done
 
-    # ── Binaries ──
+    # ── Assembly early init binary ──
     cp "${BUILD_DIR}/early_init" "${INITRAMFS_DIR}/early_init"
     chmod 755 "${INITRAMFS_DIR}/early_init"
+
+    # ── Python init script (used from squashfs via dynamic linker) ──
+    cp "${SRC_DIR}/initramfs/frost_init.py" "${INITRAMFS_DIR}/frost_init.py"
+    chmod 755 "${INITRAMFS_DIR}/frost_init.py"
+    ok "Python init script installed"
+
+    # ── /init shell bootstrap (kernel executes this) ──
+    # Uses the full init script from source, which handles:
+    #   asm early_init -> modules -> devices -> squashfs -> Python handoff
     cp "${SRC_DIR}/initramfs/init" "${INITRAMFS_DIR}/init"
     chmod 755 "${INITRAMFS_DIR}/init"
 
@@ -946,8 +1024,11 @@ set default=0
 set color_normal=cyan/black
 set color_highlight=white/blue
 
+# frOSt - Frozen Operating System
+# Init: x86-64 asm + compiled Python
+
 menuentry "frOSt Desktop" {
-    linux /boot/vmlinuz root=LABEL=FROST_ROOT ro quiet splash
+    linux /boot/vmlinuz root=LABEL=FROST_ROOT ro quiet splash loglevel=3
     initrd /boot/initramfs.img
 }
 
@@ -1020,14 +1101,17 @@ EOF
 # =============================================================================
 main() {
     echo -e "${CYAN}"
-    echo '  __       ___  ____  _   '
-    echo ' / _|_ __ / _ \/ ___|| |_ '
-    echo '| |_| |__| | | \___ \| __|'
-    echo '|  _| |  | |_| |___) | |_ '
-    echo '|_| |_|   \___/|____/ \__|'
+    echo '  :::::::::: :::::::::   ::::::::   ::::::::  ::::::::::'
+    echo '  :+:        :+:    :+: :+:    :+: :+:    :+:    :+:   '
+    echo '  +:+        +:+    +:+ +:+    +:+ +:+           +:+   '
+    echo '  :#::+::#   +#++:++#:  +#+    +:+ +#++:++#++    +#+   '
+    echo '  +#+        +#+    +#+ +#+    +#+        +#+    +#+    '
+    echo '  #+#        #+#    #+# #+#    #+# #+#    #+#    #+#    '
+    echo '  ###        ###    ###  ########   ########     ###    '
     echo -e "${RESET}"
     echo "frOSt Build System v${FROST_VERSION}"
-    echo "================================="
+    echo "Init: x86-64 asm + Python (from squashfs)"
+    echo "======================================"
     echo ""
 
     rm -rf "${BUILD_DIR}"

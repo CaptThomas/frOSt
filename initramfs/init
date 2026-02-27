@@ -1,97 +1,85 @@
 #!/bin/sh
 # =============================================================================
-# frOSt initramfs /init script
+# frOSt initramfs /init - Shell Bootstrap
 # =============================================================================
-# This is the first userspace script run by the kernel.
+# Boot chain: asm early_init -> THIS -> compiled Python frost_init
 #
-# Boot sequence:
-#   1. Run x86-64 asm early init (mounts /proc, /sys, /dev, creates dirs)
-#   2. Find frOSt USB partitions
-#   3. Mount squashfs root as lower overlay layer
-#   4. Set up overlayfs (read-only base + tmpfs transient layer)
-#   5. Mount persistence partition
-#   6. Apply persistent bind mounts from config
-#   7. Pivot root to merged overlay
-#   8. Execute real /sbin/init (systemd)
+# This shell bootstrap handles tasks that require no Python:
+#   1. Run asm early_init (mount /proc, /sys, /dev, tmpfs)
+#   2. Load kernel modules in dependency order
+#   3. Populate devices (mdev, uevents, manual node creation)
+#   4. Find and mount the squashfs root (making Python available)
+#   5. Hand off to compiled Python frost_init via squashfs linker
+#
+# The Python init handles:
+#   - OverlayFS setup, persistence, USB watchdog, switch_root
 # =============================================================================
 
-set +e  # Don't exit on errors - we handle them manually
+set +e
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
-echo "[frOSt] Starting initramfs init..."
+# ── ANSI colors ──
+C_CYAN='\033[1;36m'
+C_GREEN='\033[1;32m'
+C_RED='\033[1;31m'
+C_DIM='\033[0;37m'
+C_WHITE='\033[1;37m'
+C_BLUE='\033[1;34m'
+C_RESET='\033[0m'
 
-# Helper: calculate tmpfs size as 50% of RAM (minimum 512M)
-calc_tmpfs_size() {
-    local memtotal_kb
-    memtotal_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
-    if [ -n "$memtotal_kb" ] && [ "$memtotal_kb" -gt 0 ] 2>/dev/null; then
-        local half_mb=$(( memtotal_kb / 2 / 1024 ))
-        [ "$half_mb" -lt 512 ] && half_mb=512
-        echo "${half_mb}M"
-    else
-        echo "512M"
-    fi
-}
+log()  { echo "${C_DIM}[frOSt]${C_RESET} $1"; }
+ok()   { echo "${C_GREEN}[frOSt]${C_RESET} $1"; }
+warn() { echo "${C_RED}[frOSt] WARNING:${C_RESET} $1"; }
 
-# ---- Step 1: Early hardware init (assembly) ----
+# =============================================================================
+# Step 1: Assembly early hardware init
+# =============================================================================
 if [ -x /early_init ]; then
     /early_init
-    EARLY_RC=$?
-    if [ $EARLY_RC -ne 0 ]; then
-        echo "[frOSt] WARNING: early_init failed (code $EARLY_RC), using shell fallback"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        warn "early_init failed (code $rc), using shell fallback"
         mkdir -p /proc /sys /dev
         mount -t proc proc /proc 2>/dev/null || true
         mount -t sysfs sysfs /sys 2>/dev/null || true
         mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-        mkdir -p /frost/lower /frost/upper /frost/work /frost/merged /frost/persist
-        TMPFS_SIZE=$(calc_tmpfs_size)
-        echo "[frOSt] Tmpfs overlay size: ${TMPFS_SIZE}"
-        mount -t tmpfs -o "size=${TMPFS_SIZE}" tmpfs /frost/upper
+        mkdir -p /frost/lower /frost/upper /frost/work /frost/merged /frost/persist /frost/probe
+        tmpfs_sz="512M"
+        if [ -f /proc/meminfo ]; then
+            mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+            if [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ] 2>/dev/null; then
+                half_mb=$((mem_kb / 2 / 1024))
+                [ "$half_mb" -lt 512 ] && half_mb=512
+                tmpfs_sz="${half_mb}M"
+            fi
+        fi
+        mount -t tmpfs -o "size=${tmpfs_sz}" tmpfs /frost/upper
     fi
 else
-    echo "[frOSt] WARNING: /early_init not found, using shell fallback"
+    warn "/early_init not found, using shell fallback"
     mkdir -p /proc /sys /dev
     mount -t proc proc /proc
     mount -t sysfs sysfs /sys
     mount -t devtmpfs devtmpfs /dev
-    mkdir -p /frost/lower /frost/upper /frost/work /frost/merged /frost/persist
-    TMPFS_SIZE=$(calc_tmpfs_size)
-    echo "[frOSt] Tmpfs overlay size: ${TMPFS_SIZE}"
-    mount -t tmpfs -o "size=${TMPFS_SIZE}" tmpfs /frost/upper
+    mkdir -p /frost/lower /frost/upper /frost/work /frost/merged /frost/persist /frost/probe
+    mount -t tmpfs -o size=512M tmpfs /frost/upper
 fi
 
-# ---- Step 2: Load required kernel modules ----
-echo "[frOSt] Loading kernel modules..."
-
-# Get kernel version
+# =============================================================================
+# Step 2: Load kernel modules
+# =============================================================================
+log "Loading kernel modules..."
 KVER=$(uname -r)
 MODDIR="/lib/modules/${KVER}"
-echo "[frOSt] Kernel: ${KVER}"
-echo "[frOSt] Module dir: ${MODDIR}"
-ls "${MODDIR}" 2>/dev/null | head -5
 
-# Helper: try modprobe first, fall back to insmod with find
 load_mod() {
     local mod="$1"
-    if modprobe "$mod" 2>/dev/null; then
-        echo "[frOSt]   Loaded: $mod (modprobe)"
-        return 0
-    fi
-    # Try insmod with found module file
-    local ko=$(find "${MODDIR}" -name "${mod}.ko*" 2>/dev/null | head -1)
-    if [ -n "$ko" ] && [ -f "$ko" ]; then
-        insmod "$ko" 2>/dev/null && echo "[frOSt]   Loaded: $mod (insmod)" && return 0
-    fi
-    # Try replacing - with _
-    local mod2=$(echo "$mod" | tr '-' '_')
-    ko=$(find "${MODDIR}" -name "${mod2}.ko*" 2>/dev/null | head -1)
-    if [ -n "$ko" ] && [ -f "$ko" ]; then
-        insmod "$ko" 2>/dev/null && echo "[frOSt]   Loaded: $mod2 (insmod)" && return 0
-    fi
+    modprobe "$mod" 2>/dev/null && return 0
+    local ko=$(find "${MODDIR}" -name "${mod}.ko*" -o -name "$(echo "$mod" | tr '-' '_').ko*" 2>/dev/null | head -1)
+    [ -n "$ko" ] && [ -f "$ko" ] && insmod "$ko" 2>/dev/null && return 0
     return 1
 }
 
-# Load in dependency order
 for mod in scsi_common scsi_mod t10-pi crct10dif_common crct10dif_generic crc-t10dif crc32c_generic crc64_rocksoft sd_mod sg \
            libata ata_piix ata_generic ahci libahci \
            virtio virtio_ring virtio_pci virtio_pci_modern_dev virtio_pci_legacy_dev \
@@ -103,113 +91,87 @@ for mod in scsi_common scsi_mod t10-pi crct10dif_common crct10dif_generic crc-t1
            drm drm_kms_helper bochs-drm virtio-gpu simpledrm; do
     load_mod "$mod" || true
 done
+ok "Modules loaded (kernel ${KVER})"
 
-echo "[frOSt] Module loading complete"
-echo "[frOSt] Loaded modules:"
-cat /proc/modules 2>/dev/null | awk '{print "  "$1}' | head -30
-
-# Trigger device detection using mdev (busybox udev alternative)
-echo "[frOSt] Populating /dev..."
-if [ -f /proc/sys/kernel/hotplug ]; then
-    echo /bin/mdev > /proc/sys/kernel/hotplug
-fi
+# =============================================================================
+# Step 3: Device population
+# =============================================================================
+log "Populating devices..."
+echo /bin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
 mdev -s 2>/dev/null || true
 
-# Retrigger uevents so mdev picks up all devices including USB
-# This is critical on real hardware where USB enumeration is async
-echo "[frOSt] Triggering device uevents..."
+# Retrigger uevents for USB/SCSI/PCI
 if [ -d /sys/bus ]; then
     for uevent in /sys/bus/usb/devices/*/uevent /sys/bus/scsi/devices/*/uevent /sys/bus/pci/devices/*/uevent; do
         [ -f "$uevent" ] && echo "add" > "$uevent" 2>/dev/null || true
     done
 fi
-
-# Wait for USB devices to enumerate - real hardware needs 3-5 seconds
-echo "[frOSt] Waiting for USB device enumeration..."
+log "Waiting for USB enumeration..."
 sleep 3
 mdev -s 2>/dev/null || true
 
-# ---- Step 3: Find frOSt partitions ----
-echo "[frOSt] Searching for frOSt partitions..."
-
-# Ensure all block device nodes exist by scanning /sys/block
-# mdev doesn't always create all partition nodes reliably
+# Ensure all block device nodes exist
 ensure_dev_nodes() {
     for sysblk in /sys/block/*; do
         bname=$(basename "$sysblk")
-        # Skip loop/ram devices
         case "$bname" in loop*|ram*) continue ;; esac
-
         majmin=$(cat "$sysblk/dev" 2>/dev/null) || continue
-        maj="${majmin%%:*}"
-        min="${majmin##*:}"
-
-        # Create base device node if missing
+        maj="${majmin%%:*}"; min="${majmin##*:}"
         [ -b "/dev/$bname" ] || mknod "/dev/$bname" b "$maj" "$min" 2>/dev/null || true
-
-        # Create partition nodes
         for part in "$sysblk/$bname"*/dev; do
             [ -f "$part" ] || continue
             pname=$(basename "$(dirname "$part")")
             pmajmin=$(cat "$part" 2>/dev/null) || continue
-            pmaj="${pmajmin%%:*}"
-            pmin="${pmajmin##*:}"
+            pmaj="${pmajmin%%:*}"; pmin="${pmajmin##*:}"
             [ -b "/dev/$pname" ] || mknod "/dev/$pname" b "$pmaj" "$pmin" 2>/dev/null || true
         done
     done
 }
+ensure_dev_nodes
 
-echo "[frOSt] /sys/block contents:"
-ls /sys/block/ 2>/dev/null || echo "  (empty)"
-
+# =============================================================================
+# Step 4: Find frOSt root partition
+# =============================================================================
+log "Searching for frOSt partitions..."
 ROOT_DEV=""
 PERSIST_DEV=""
-
-# Wait for devices to appear (up to 30 seconds - real USB can be slow)
 TRIES=0
 MAX_TRIES=30
+
 while [ $TRIES -lt $MAX_TRIES ]; do
-    # Re-trigger mdev scan and ensure device nodes exist
     mdev -s 2>/dev/null || true
     ensure_dev_nodes
 
-    # Log every 5th attempt to avoid spam
     if [ $((TRIES % 5)) -eq 0 ]; then
-        echo "[frOSt] Scan $TRIES/$MAX_TRIES - /sys/block:"
-        ls /sys/block/ 2>/dev/null | tr '\n' ' '
-        echo ""
-        echo "[frOSt]   /dev devices:"
-        ls /dev/[shv]d* /dev/hd* /dev/mmcblk* /dev/nvme* 2>/dev/null || echo "    (none yet)"
+        blocks=$(ls /sys/block/ 2>/dev/null | grep -v 'loop\|ram' | tr '\n' ' ')
+        log "Scan $TRIES/$MAX_TRIES - blocks: $blocks"
     fi
 
-    # Method 1: findfs (busybox built-in, scans all /dev block devices)
+    # Method 1: findfs
     ROOT_DEV=$(findfs LABEL=FROST_ROOT 2>/dev/null) || true
     if [ -n "$ROOT_DEV" ]; then
-        echo "[frOSt] Found FROST_ROOT: $ROOT_DEV (findfs)"
+        ok "Found FROST_ROOT: $ROOT_DEV (findfs)"
         PERSIST_DEV=$(findfs LABEL=FROST_PERSIST 2>/dev/null) || true
         break
     fi
 
-    # Method 2: /dev/disk/by-label (udev creates these)
+    # Method 2: by-label
     if [ -e /dev/disk/by-label/FROST_ROOT ]; then
         ROOT_DEV=$(readlink -f /dev/disk/by-label/FROST_ROOT)
-        echo "[frOSt] Found FROST_ROOT via by-label: $ROOT_DEV"
-        [ -e /dev/disk/by-label/FROST_PERSIST ] && \
-            PERSIST_DEV=$(readlink -f /dev/disk/by-label/FROST_PERSIST)
+        ok "Found FROST_ROOT: $ROOT_DEV (by-label)"
+        [ -e /dev/disk/by-label/FROST_PERSIST ] && PERSIST_DEV=$(readlink -f /dev/disk/by-label/FROST_PERSIST)
         break
     fi
 
-    # Method 3: Probe partition 2 of each disk for rootfs.squashfs
+    # Method 3: probe
     for sysblk in /sys/block/sd* /sys/block/vd* /sys/block/hd* /sys/block/mmcblk* /sys/block/nvme*; do
         [ -d "$sysblk" ] || continue
         bname=$(basename "$sysblk")
-
         p2dev=""
         case "$bname" in
             sd*|vd*|hd*) p2dev="/dev/${bname}2" ;;
             mmcblk*|nvme*) p2dev="/dev/${bname}p2" ;;
         esac
-
         if [ -b "$p2dev" ]; then
             mkdir -p /frost/probe
             if mount -o ro "$p2dev" /frost/probe 2>/dev/null; then
@@ -220,7 +182,7 @@ while [ $TRIES -lt $MAX_TRIES ]; do
                         sd*|vd*|hd*) PERSIST_DEV="/dev/${bname}3" ;;
                         mmcblk*|nvme*) PERSIST_DEV="/dev/${bname}p3" ;;
                     esac
-                    echo "[frOSt] Found frOSt root by probing: $ROOT_DEV"
+                    ok "Found FROST_ROOT: $ROOT_DEV (probe)"
                     break 2
                 fi
                 umount /frost/probe
@@ -234,214 +196,147 @@ done
 
 if [ -z "$ROOT_DEV" ]; then
     echo ""
-    echo "[frOSt] ============================================"
-    echo "[frOSt] FATAL: No frOSt device found after $TRIES seconds!"
-    echo "[frOSt] ============================================"
+    echo "${C_RED}[frOSt] ============================================${C_RESET}"
+    echo "${C_RED}[frOSt] FATAL: No frOSt device found!${C_RESET}"
+    echo "${C_RED}[frOSt] ============================================${C_RESET}"
     echo ""
-    echo "[frOSt] --- /sys/block ---"
-    ls -la /sys/block/ 2>/dev/null || echo "    (empty)"
+    echo "[frOSt] /proc/partitions:"
+    cat /proc/partitions 2>/dev/null
     echo ""
-    echo "[frOSt] --- /dev block devices ---"
-    ls -la /dev/[shv]d* /dev/mmcblk* /dev/nvme* /dev/hd* /dev/vd* 2>/dev/null || echo "    (none)"
-    echo ""
-    echo "[frOSt] --- /proc/partitions ---"
-    cat /proc/partitions 2>/dev/null || echo "    (failed)"
-    echo ""
-    echo "[frOSt] --- Loaded modules ---"
+    echo "[frOSt] Loaded modules:"
     cat /proc/modules 2>/dev/null | awk '{print "  "$1}' | head -30
     echo ""
-    echo "[frOSt] --- dmesg (USB/SCSI/block related) ---"
-    dmesg 2>/dev/null | grep -iE "usb|scsi|sd[a-z]|block|storage|xhci|ehci|error|fail" | tail -40
-    echo ""
-    echo "[frOSt] --- Full dmesg (last 50 lines) ---"
-    dmesg 2>/dev/null | tail -50
-    echo ""
+    dmesg 2>/dev/null | grep -iE "usb|scsi|sd[a-z]|error|fail" | tail -30
     echo "[frOSt] Dropping to emergency shell..."
-    echo "[frOSt] Debug: try 'cat /proc/partitions' and 'ls /sys/block/'"
     exec /bin/sh
 fi
 
-echo "[frOSt] Root partition: $ROOT_DEV"
-echo "[frOSt] Persist partition: $PERSIST_DEV"
+# =============================================================================
+# Step 5: Mount squashfs
+# =============================================================================
+log "Mounting root filesystem..."
+TMP_MNT="/frost/tmp_root"
+mkdir -p "$TMP_MNT"
 
-# ---- Step 4: Mount squashfs root as lower layer ----
-echo "[frOSt] Mounting root filesystem..."
-
-# Try mounting directly as squashfs first
+mounted_squashfs=0
+# Try direct squashfs mount
 if mount -t squashfs -o ro "$ROOT_DEV" /frost/lower 2>/dev/null; then
-    echo "[frOSt] Mounted squashfs root directly"
+    ok "Mounted squashfs directly"
+    mounted_squashfs=1
 else
-    # Try as ext4 partition containing rootfs.squashfs
-    TMP_MNT="/frost/tmp_root"
-    mkdir -p "$TMP_MNT"
+    # Try ext4 containing rootfs.squashfs
     if mount -o ro "$ROOT_DEV" "$TMP_MNT" 2>/dev/null; then
         if [ -f "$TMP_MNT/rootfs.squashfs" ]; then
             mount -t squashfs -o ro,loop "$TMP_MNT/rootfs.squashfs" /frost/lower
-            echo "[frOSt] Mounted squashfs from rootfs.squashfs"
+            ok "Mounted squashfs from rootfs.squashfs"
+            mounted_squashfs=1
         else
-            # Direct ext4 root - remount to lower
             umount "$TMP_MNT"
             mount -o ro "$ROOT_DEV" /frost/lower
-            echo "[frOSt] Mounted ext4 root directly"
+            ok "Mounted ext4 root directly"
+            mounted_squashfs=1
         fi
-    else
-        echo "[frOSt] FATAL: Cannot mount root partition $ROOT_DEV"
-        echo "[frOSt] Trying blkid:"
-        blkid "$ROOT_DEV" 2>/dev/null || echo "  blkid failed"
-        echo "[frOSt] Trying mount with verbose:"
-        mount -o ro "$ROOT_DEV" /frost/lower 2>&1 || echo "  mount failed"
-        echo "[frOSt] Loaded filesystems:"
-        cat /proc/filesystems 2>/dev/null || true
-        exec /bin/sh
     fi
 fi
 
-# Verify root has essential files
-if [ ! -e /frost/lower/sbin/init ] && [ ! -e /frost/lower/lib/systemd/systemd ]; then
-    echo "[frOSt] WARNING: Root filesystem may be incomplete (no /sbin/init found)"
-fi
-
-# ---- Step 5: Set up overlayfs ----
-echo "[frOSt] Setting up overlayfs..."
-mkdir -p /frost/upper/upper /frost/upper/work /frost/merged
-
-mount -t overlay overlay \
-    -o "lowerdir=/frost/lower,upperdir=/frost/upper/upper,workdir=/frost/upper/work" \
-    /frost/merged
-
-if [ $? -ne 0 ]; then
-    echo "[frOSt] FATAL: overlayfs mount failed"
+if [ $mounted_squashfs -eq 0 ]; then
+    echo "${C_RED}[frOSt] FATAL: Cannot mount root${C_RESET}"
     exec /bin/sh
 fi
-echo "[frOSt] Overlayfs mounted successfully"
 
-# ---- Step 6: Mount persistence partition ----
-HAS_PERSIST=0
-if [ -n "$PERSIST_DEV" ] && [ -b "$PERSIST_DEV" ]; then
-    echo "[frOSt] Mounting persistence partition..."
-    if mount -o rw "$PERSIST_DEV" /frost/persist; then
-        HAS_PERSIST=1
-        mkdir -p /frost/persist/data
-        echo "[frOSt] Persistence partition mounted"
-    else
-        echo "[frOSt] WARNING: Cannot mount persistence partition"
-    fi
-fi
+# =============================================================================
+# Step 6: Hand off to Python init
+# =============================================================================
+# Now that squashfs is mounted, Python is available at /frost/lower/usr/bin/python3
+# We invoke it via the squashfs dynamic linker because the ELF interpreter path
+# in the Python binary doesn't exist in the initramfs.
+log "Handing off to Python init..."
 
-# ---- Step 7: Apply persistent bind mounts ----
-if [ $HAS_PERSIST -eq 1 ] && [ -f /frost/persist/frost-persist.json ]; then
-    echo "[frOSt] Applying persistence configuration..."
+PYBIN="/frost/lower/usr/bin/python3"
+PY_INIT="/frost_init.py"
 
-    # Parse JSON config with shell (extract persistent_paths array)
-    # Simple JSON parser using grep/sed for the paths
-    PERSIST_PATHS=$(grep -o '"\/[^"]*"' /frost/persist/frost-persist.json | tr -d '"' | sort -u)
-
-    for PPATH in $PERSIST_PATHS; do
-        STORE="/frost/persist/data${PPATH}"
-        MERGED="/frost/merged${PPATH}"
-
-        # Skip non-path entries
-        case "$PPATH" in
-            /*)  ;; # valid path
-            *)   continue ;;
-        esac
-
-        # Initialize persistence storage if needed
-        if [ ! -e "$STORE" ]; then
-            mkdir -p "$(dirname "$STORE")"
-            if [ -d "$MERGED" ]; then
-                cp -a "$MERGED" "$STORE" 2>/dev/null || mkdir -p "$STORE"
-                echo "[frOSt]   Initialized: $PPATH"
-            elif [ -f "$MERGED" ]; then
-                cp -a "$MERGED" "$STORE" 2>/dev/null || true
-                echo "[frOSt]   Initialized: $PPATH (file)"
-            else
-                mkdir -p "$STORE"
-            fi
-        fi
-
-        # Bind mount persistent data over overlay
-        if [ -d "$STORE" ] && [ -d "$MERGED" ]; then
-            mount --bind "$STORE" "$MERGED" 2>/dev/null && \
-                echo "[frOSt]   Persisted: $PPATH" || \
-                echo "[frOSt]   FAILED: $PPATH"
-        elif [ -f "$STORE" ] && [ -f "$MERGED" ]; then
-            mount --bind "$STORE" "$MERGED" 2>/dev/null && \
-                echo "[frOSt]   Persisted: $PPATH (file)" || \
-                echo "[frOSt]   FAILED: $PPATH"
-        elif [ -d "$STORE" ]; then
-            mkdir -p "$MERGED" 2>/dev/null
-            mount --bind "$STORE" "$MERGED" 2>/dev/null && \
-                echo "[frOSt]   Persisted: $PPATH" || \
-                echo "[frOSt]   FAILED: $PPATH"
-        fi
-    done
-fi
-
-# ---- Step 8: Set up essential filesystems in merged root ----
-echo "[frOSt] Setting up merged root..."
-mkdir -p /frost/merged/proc /frost/merged/sys /frost/merged/dev \
-         /frost/merged/dev/pts /frost/merged/dev/shm \
-         /frost/merged/run /frost/merged/tmp
-
-# Make overlay internals accessible after switch_root
-mkdir -p /frost/merged/frost/lower /frost/merged/frost/upper \
-         /frost/merged/frost/persist
-mount --bind /frost/lower /frost/merged/frost/lower 2>/dev/null || true
-mount --bind /frost/upper /frost/merged/frost/upper 2>/dev/null || true
-if [ $HAS_PERSIST -eq 1 ]; then
-    mount --bind /frost/persist /frost/merged/frost/persist 2>/dev/null || true
-fi
-
-# Install frOSt tools into merged root
-FROST_BIN="/frost/merged/usr/local/bin"
-FROST_ETC="/frost/merged/etc/frost"
-mkdir -p "$FROST_BIN" "$FROST_ETC"
-
-for tool in frost-persist.py frost-overlay.py frost-config.py; do
-    if [ -f "/${tool}" ]; then
-        TOOLNAME=$(echo "$tool" | sed 's/\.py$//')
-        cp "/${tool}" "${FROST_BIN}/${TOOLNAME}"
-        chmod 755 "${FROST_BIN}/${TOOLNAME}"
+# Find the dynamic linker in the squashfs
+LD_LINUX=""
+for ld in /frost/lower/lib64/ld-linux-x86-64.so.2 \
+          /frost/lower/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \
+          /frost/lower/lib/ld-linux-x86-64.so.2; do
+    if [ -f "$ld" ]; then
+        LD_LINUX="$ld"
+        break
     fi
 done
 
-# Write overlay info for tools (paths as seen after switch_root)
-cat > "$FROST_ETC/overlay.json" << OVERLAYINFO
-{
-    "lower": "/frost/lower",
-    "upper": "/frost/upper",
-    "merged": "/",
-    "persist": "/frost/persist",
-    "persist_data": "/frost/persist/data"
-}
-OVERLAYINFO
+python_ok=0
+if [ -n "$LD_LINUX" ] && [ -f "$PYBIN" ] && [ -f "$PY_INIT" ]; then
+    # Set up library paths so Python can find its libs from the squashfs
+    export LD_LIBRARY_PATH="/frost/lower/usr/lib/x86_64-linux-gnu:/frost/lower/lib/x86_64-linux-gnu:/frost/lower/lib64"
+    export PYTHONHOME="/frost/lower/usr"
+    export PYTHONDONTWRITEBYTECODE=1
 
-# ---- Step 9: Switch to merged root ----
-echo "[frOSt] Switching to merged root..."
+    # Pass device info to Python via environment
+    export FROST_ROOT_DEV="$ROOT_DEV"
+    export FROST_PERSIST_DEV="$PERSIST_DEV"
 
-# Mount virtual filesystems in the new root
-mount -t proc proc /frost/merged/proc 2>/dev/null || true
-mount -t sysfs sysfs /frost/merged/sys 2>/dev/null || true
-mount -t devtmpfs devtmpfs /frost/merged/dev 2>/dev/null || true
-mount -t devpts devpts /frost/merged/dev/pts 2>/dev/null || true
-mount -t tmpfs tmpfs /frost/merged/dev/shm 2>/dev/null || true
-mount -t tmpfs tmpfs /frost/merged/run 2>/dev/null || true
-mount -t tmpfs tmpfs /frost/merged/tmp 2>/dev/null || true
+    ok "Linker: $LD_LINUX"
+    log "Running: $LD_LINUX $PYBIN $PY_INIT"
 
-echo "[frOSt] Boot complete! Starting system..."
-
-# Verify init exists
-if [ -x /frost/merged/sbin/init ]; then
-    echo "[frOSt] Found /sbin/init"
-elif [ -x /frost/merged/lib/systemd/systemd ]; then
-    echo "[frOSt] Found systemd"
+    # Run Python init - if it succeeds it will exec switch_root and never return
+    "$LD_LINUX" "$PYBIN" "$PY_INIT" "$@"
+    pyrc=$?
+    # If we get here, Python init failed to exec switch_root
+    warn "Python init exited with code $pyrc"
 else
-    echo "[frOSt] WARNING: No init found, checking..."
-    ls -la /frost/merged/sbin/ 2>/dev/null | head -10
-    ls -la /frost/merged/lib/systemd/ 2>/dev/null | head -5
+    if [ -z "$LD_LINUX" ]; then
+        warn "Dynamic linker not found in squashfs"
+    fi
+    if [ ! -f "$PYBIN" ]; then
+        warn "Python not found at $PYBIN"
+    fi
+    if [ ! -f "$PY_INIT" ]; then
+        warn "frost_init.py not found at $PY_INIT"
+    fi
 fi
 
-# Use switch_root (proper way for initramfs)
-# switch_root moves mounts and deletes initramfs contents
+# =============================================================================
+# Shell fallback: overlay + basic persistence + switch_root
+# =============================================================================
+warn "Using shell fallback for boot completion"
+
+# Check if overlay is already set up by Python (it might have set up overlay but failed at switch_root)
+if mountpoint -q /frost/merged 2>/dev/null; then
+    ok "Overlay already mounted (from Python init)"
+else
+    log "Setting up overlay filesystem..."
+    mkdir -p /frost/upper/upper /frost/upper/work
+    mount -t overlay overlay \
+        -o "lowerdir=/frost/lower,upperdir=/frost/upper/upper,workdir=/frost/upper/work" \
+        /frost/merged || { echo "${C_RED}[frOSt] FATAL: overlayfs failed${C_RESET}"; exec /bin/sh; }
+    ok "Overlay mounted (shell fallback)"
+
+    # Basic persistence
+    if [ -n "$PERSIST_DEV" ] && [ -b "$PERSIST_DEV" ]; then
+        if ! mountpoint -q /frost/persist 2>/dev/null; then
+            mount -o rw "$PERSIST_DEV" /frost/persist 2>/dev/null && mkdir -p /frost/persist/data
+        fi
+    fi
+fi
+
+# Ensure virtual filesystems are mounted
+mkdir -p /frost/merged/proc /frost/merged/sys /frost/merged/dev /frost/merged/run /frost/merged/tmp
+mountpoint -q /frost/merged/proc 2>/dev/null || mount -t proc proc /frost/merged/proc 2>/dev/null || true
+mountpoint -q /frost/merged/sys 2>/dev/null || mount -t sysfs sysfs /frost/merged/sys 2>/dev/null || true
+mountpoint -q /frost/merged/dev 2>/dev/null || mount -t devtmpfs devtmpfs /frost/merged/dev 2>/dev/null || true
+mountpoint -q /frost/merged/run 2>/dev/null || mount -t tmpfs tmpfs /frost/merged/run 2>/dev/null || true
+mountpoint -q /frost/merged/tmp 2>/dev/null || mount -t tmpfs tmpfs /frost/merged/tmp 2>/dev/null || true
+
+# Verify /sbin/init exists
+if [ ! -f /frost/merged/sbin/init ] && [ ! -L /frost/merged/sbin/init ]; then
+    echo "${C_RED}[frOSt] FATAL: /sbin/init not found in merged root${C_RESET}"
+    echo "[frOSt] Contents of /frost/merged/sbin/:"
+    ls -la /frost/merged/sbin/ 2>/dev/null | head -20
+    echo "[frOSt] Dropping to emergency shell..."
+    exec /bin/sh
+fi
+
+ok "Boot complete - switching to merged root"
 exec switch_root /frost/merged /sbin/init "$@"
