@@ -32,7 +32,8 @@ cleanup() {
     umount ${BUILD}/sqfs 2>/dev/null || true
     umount ${BUILD}/root 2>/dev/null || true
     umount ${BUILD}/efi 2>/dev/null || true
-    local l=$(losetup -j "${IMG}" 2>/dev/null | head -1 | cut -d: -f1)
+    local l
+    l=$(losetup -j "${IMG}" 2>/dev/null | awk -F: 'NR==1{print $1}') || true
     [ -n "$l" ] && losetup -d "$l" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -45,7 +46,8 @@ log "Mounting image..."
 losetup -D 2>/dev/null || true
 losetup -fP "${IMG}"
 sleep 1
-LOOP=$(losetup -j "${IMG}" | head -1 | cut -d: -f1)
+LOOP=$(losetup -j "${IMG}" 2>/dev/null | awk -F: 'NR==1{print $1}') || true
+[ -z "$LOOP" ] && err "losetup failed"
 sleep 1; partprobe "${LOOP}" 2>/dev/null || true; sleep 1
 log "Loop: ${LOOP}"
 
@@ -69,10 +71,38 @@ ok "early_init: $(stat -c%s ${BUILD}/early_init) bytes"
 log "Building initramfs..."
 mkdir -p ${INITRAMFS}/{bin,sbin,usr/bin,usr/sbin,lib,lib64,dev,proc,sys,etc,run,tmp,frost}
 
-# Busybox
-BB=$(command -v busybox || echo /bin/busybox)
-cp "$BB" ${INITRAMFS}/bin/busybox
+# Busybox - prefer static from rootfs, or use system busybox + dynamic linker
+if [[ -f "${ROOTFS}/bin/busybox" ]]; then
+    log "Using busybox from rootfs"
+    cp "${ROOTFS}/bin/busybox" ${INITRAMFS}/bin/busybox
+    # Check if it's dynamic and copy linker if needed
+    if ldd "${ROOTFS}/bin/busybox" 2>/dev/null | grep -q "ld-"; then
+        log "Copying dynamic linker for busybox"
+        # Debian uses /lib64/ld-linux-x86-64.so.2 or /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+        for linker in "${ROOTFS}/lib64/ld-linux-x86-64.so.2" "${ROOTFS}/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"; do
+            if [[ -f "$linker" ]]; then
+                mkdir -p ${INITRAMFS}/$(dirname "${linker#${ROOTFS}}")
+                cp "$linker" ${INITRAMFS}/"${linker#${ROOTFS}}"
+            fi
+        done
+        # Copy libc and other deps
+        for libdir in "${ROOTFS}/lib" "${ROOTFS}/lib64" "${ROOTFS}/lib/x86_64-linux-gnu"; do
+            [[ -d "$libdir" ]] && cp -r "$libdir" ${INITRAMFS}/ 2>/dev/null || true
+        done
+    fi
+else
+    log "Using system busybox"
+    BB=$(command -v busybox || echo /bin/busybox)
+    cp "$BB" ${INITRAMFS}/bin/busybox
+    # Copy musl dynamic linker if busybox is dynamic
+    if ldd "$BB" 2>/dev/null | grep -q "ld-musl"; then
+        log "Copying musl linker for busybox"
+        mkdir -p ${INITRAMFS}/lib
+        cp /lib/ld-musl-x86_64.so.1 ${INITRAMFS}/lib/ 2>/dev/null || true
+    fi
+fi
 chmod 755 ${INITRAMFS}/bin/busybox
+ok "Busybox installed"
 
 for cmd in sh ash mount umount mkdir cat echo ls cp mv rm ln chmod chown \
            mknod switch_root pivot_root sleep grep sed awk printf \
@@ -128,7 +158,7 @@ done
 for pat in "overlay.ko*" "squashfs.ko*" "loop.ko*" "virtio*.ko*" \
            "libata.ko*" "ahci.ko*" "sd_mod.ko*" "scsi_mod.ko*" \
            "ext4.ko*" "jbd2.ko*" "crc*.ko*" "mbcache.ko*" \
-           "drm.ko*" "drm_kms_helper.ko*" "simpledrm.ko*"; do
+           "drm.ko*" "drm_kms_helper.ko*" "bochs.ko*"; do
     find "${MOD_SRC}" -name "${pat}" 2>/dev/null | while read -r f; do
         rel="${f#${MOD_SRC}/}"
         d="${MOD_DST}/$(dirname "$rel")"

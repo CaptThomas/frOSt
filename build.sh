@@ -83,36 +83,36 @@ preflight() {
 build_rootfs() {
     log "Building Debian rootfs (${DEBIAN_RELEASE})..."
     umount_chroot
+    # Kill any remaining mounts under rootfs (stale from previous builds)
+    mount | grep "${ROOTFS_DIR}" | awk '{print $3}' | sort -r | while read -r mp; do
+        umount -l "$mp" 2>/dev/null || true
+    done || true
     rm -rf "${ROOTFS_DIR}"
     mkdir -p "${ROOTFS_DIR}"
 
     # All packages in one debootstrap call (apt unreliable in WSL chroot)
-    debootstrap \
-        --variant=minbase \
-        --components=main,contrib,non-free,non-free-firmware \
-        --include=systemd,systemd-sysv,systemd-timesyncd,udev,dbus,apt,\
-python3,python3-minimal,python3-pil,\
-iproute2,iputils-ping,net-tools,bash,coreutils,util-linux,mount,\
-kmod,procps,passwd,login,adduser,sudo,locales,\
-linux-image-amd64,grub-efi-amd64,grub-pc-bin,\
-xfce4,xfce4-terminal,lightdm,lightdm-gtk-greeter,\
-xorg,xserver-xorg-video-all,dbus-x11,at-spi2-core,policykit-1,\
-xfce4-whiskermenu-plugin,xfce4-screenshooter,\
-xfce4-power-manager,xfce4-taskmanager,\
-mousepad,thunar-archive-plugin,file-roller,\
-network-manager-gnome,\
-wpasupplicant,iw,wireless-tools,rfkill,wireless-regdb,\
-firmware-linux-free,firmware-iwlwifi,\
-fonts-hack,fonts-liberation2,fonts-noto-color-emoji,\
-conky-all,neofetch,htop,\
-librsvg2-bin,\
-pulseaudio,pavucontrol,\
-gdisk,parted,pciutils,usbutils,\
-picom,papirus-icon-theme,\
-firefox-esr \
-        "${DEBIAN_RELEASE}" \
-        "${ROOTFS_DIR}" \
+    # Note: mousepad removed (transient network download issues in some mirrors; available via apt post-boot)
+    local debootstrap_include="systemd,systemd-sysv,systemd-timesyncd,udev,dbus,apt,python3,python3-minimal,python3-pil,python3-gi,gir1.2-gtk-3.0,iproute2,iputils-ping,net-tools,bash,coreutils,util-linux,mount,kmod,procps,passwd,login,adduser,sudo,locales,linux-image-amd64,grub-efi-amd64,grub-pc-bin,xfce4,xfce4-terminal,lightdm,lightdm-gtk-greeter,xorg,xserver-xorg-video-all,dbus-x11,at-spi2-core,policykit-1,xfce4-whiskermenu-plugin,xfce4-screenshooter,xfce4-power-manager,xfce4-taskmanager,thunar-archive-plugin,file-roller,network-manager-gnome,wpasupplicant,iw,wireless-tools,rfkill,wireless-regdb,firmware-linux-free,firmware-iwlwifi,fonts-hack,fonts-liberation2,fonts-noto-color-emoji,conky-all,neofetch,htop,librsvg2-bin,pulseaudio,pavucontrol,gdisk,parted,pciutils,usbutils,picom,papirus-icon-theme,firefox-esr"
+
+    # Try strict signature validation first; some non-Debian host distros ship
+    # stale keyrings and need a fallback for reproducible local builds.
+    local debootstrap_opts=(
+        "--variant=minbase"
+        "--components=main,contrib,non-free,non-free-firmware"
+        "--include=${debootstrap_include}"
+        "${DEBIAN_RELEASE}"
+        "${ROOTFS_DIR}"
         "${DEBIAN_MIRROR}"
+    )
+
+    if ! debootstrap "${debootstrap_opts[@]}"; then
+        warn "debootstrap failed; retrying with --no-check-gpg fallback"
+        rm -rf "${ROOTFS_DIR}"
+        mkdir -p "${ROOTFS_DIR}"
+        debootstrap \
+            --no-check-gpg \
+            "${debootstrap_opts[@]}"
+    fi
 
     ok "Debootstrap complete"
     configure_rootfs
@@ -773,6 +773,14 @@ WALLPAPER_PY
     # ── Conky ──
     cp "${SRC_DIR}/desktop/conky/conky.conf" "${ROOTFS_DIR}/etc/frost/"
 
+    # ── Desktop spinning logo overlay ──
+    cp "${SRC_DIR}/desktop/spinning-logo.py" "${ROOTFS_DIR}/usr/local/bin/frost-spinning-logo"
+    chmod 755 "${ROOTFS_DIR}/usr/local/bin/frost-spinning-logo"
+    
+    # ── Logo startup wrapper script ──
+    cp "${SRC_DIR}/desktop/autostart/frost-start-logo.sh" "${ROOTFS_DIR}/usr/local/bin/"
+    chmod 755 "${ROOTFS_DIR}/usr/local/bin/frost-start-logo.sh"
+
     # ── Autostart entries ──
     local user_autostart="${ROOTFS_DIR}/home/frost/.config/autostart"
     local sys_autostart="${ROOTFS_DIR}/etc/xdg/autostart"
@@ -781,6 +789,8 @@ WALLPAPER_PY
     cp "${SRC_DIR}/desktop/autostart/conky.desktop" "${sys_autostart}/"
     cp "${SRC_DIR}/desktop/autostart/picom.desktop" "${user_autostart}/"
     cp "${SRC_DIR}/desktop/autostart/picom.desktop" "${sys_autostart}/"
+    cp "${SRC_DIR}/desktop/autostart/spinning-logo.desktop" "${user_autostart}/"
+    cp "${SRC_DIR}/desktop/autostart/spinning-logo.desktop" "${sys_autostart}/"
 
     # ── Neofetch ──
     local user_neofetch="${ROOTFS_DIR}/home/frost/.config/neofetch"
@@ -844,6 +854,28 @@ build_initramfs() {
         cp /bin/busybox "${INITRAMFS_DIR}/bin/busybox" 2>/dev/null || err "No busybox found"
     fi
     chmod 755 "${INITRAMFS_DIR}/bin/busybox"
+
+    # If busybox is dynamically linked, copy interpreter/libs into initramfs.
+    # This prevents kernel "failed to execute /init (error -2)" on hosts where
+    # /bin/busybox is not static.
+    if ldd "${INITRAMFS_DIR}/bin/busybox" 2>/dev/null | grep -vq "not a dynamic executable"; then
+        log "Busybox is dynamic; copying runtime linker/libs"
+        ldd "${INITRAMFS_DIR}/bin/busybox" 2>/dev/null \
+            | awk '{print $3}' \
+            | grep '^/' \
+            | while read -r lib; do
+                mkdir -p "${INITRAMFS_DIR}$(dirname "$lib")"
+                cp -L "$lib" "${INITRAMFS_DIR}$lib" 2>/dev/null || true
+            done
+        # Copy ELF interpreter path too (first column like /lib/ld-musl-*.so.1)
+        ldd "${INITRAMFS_DIR}/bin/busybox" 2>/dev/null \
+            | awk '{print $1}' \
+            | grep '^/' \
+            | while read -r interp; do
+                mkdir -p "${INITRAMFS_DIR}$(dirname "$interp")"
+                cp -L "$interp" "${INITRAMFS_DIR}$interp" 2>/dev/null || true
+            done
+    fi
 
     # Busybox symlinks
     for cmd in sh ash mount umount mkdir cat echo ls cp mv rm ln chmod chown \

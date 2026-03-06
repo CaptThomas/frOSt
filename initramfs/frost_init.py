@@ -74,7 +74,8 @@ def fatal(msg):
 # =============================================================================
 def sh(cmd):
     """Run shell command, return exit code."""
-    return os.system(f"{cmd} 2>/dev/null") >> 8
+    ret = os.system(f"{cmd} 2>/dev/null")
+    return os.WEXITSTATUS(ret) if os.WIFEXITED(ret) else 1
 
 def sh_ok(cmd):
     """Run shell command, return True if success."""
@@ -308,7 +309,15 @@ def switch_to_init():
     _write(f"{CYAN}[frOSt]{RESET} {WHITE}Boot complete → starting system{RESET}\n")
     _write(f"{CYAN}{'─' * 50}{RESET}\n\n")
 
-    os.execv("/bin/busybox", ["switch_root", OVERLAY_MERGED, init_path])
+    # If we are PID 1, exec switch_root directly.
+    # Otherwise (subprocess of shell init), write init_path for shell and exit 0.
+    if os.getpid() == 1:
+        os.execv("/bin/busybox", ["switch_root", OVERLAY_MERGED, init_path])
+    else:
+        # Write the init path so shell can use it
+        write_file("/frost/.init_path", init_path)
+        # Exit 0 to signal success to shell init
+        sys.exit(0)
 
 # =============================================================================
 # Debug dump

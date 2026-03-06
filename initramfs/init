@@ -15,6 +15,9 @@
 #   - OverlayFS setup, persistence, USB watchdog, switch_root
 # =============================================================================
 
+# Early debug - write directly to console before anything else
+echo "[frOSt] INIT START" >/dev/console 2>&1
+
 set +e
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
@@ -34,35 +37,34 @@ warn() { echo "${C_RED}[frOSt] WARNING:${C_RESET} $1"; }
 # =============================================================================
 # Step 1: Assembly early hardware init
 # =============================================================================
+shell_fallback() {
+    mkdir -p /proc /sys /dev
+    mount -t proc proc /proc 2>/dev/null || true
+    mount -t sysfs sysfs /sys 2>/dev/null || true
+    mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+    mkdir -p /frost/lower /frost/upper /frost/work /frost/merged /frost/persist /frost/probe
+    tmpfs_sz="512M"
+    if [ -f /proc/meminfo ]; then
+        mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+        if [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ] 2>/dev/null; then
+            half_mb=$((mem_kb / 2 / 1024))
+            [ "$half_mb" -lt 512 ] && half_mb=512
+            tmpfs_sz="${half_mb}M"
+        fi
+    fi
+    mount -t tmpfs -o "size=${tmpfs_sz}" tmpfs /frost/upper
+}
+
 if [ -x /early_init ]; then
     /early_init
     rc=$?
     if [ $rc -ne 0 ]; then
         warn "early_init failed (code $rc), using shell fallback"
-        mkdir -p /proc /sys /dev
-        mount -t proc proc /proc 2>/dev/null || true
-        mount -t sysfs sysfs /sys 2>/dev/null || true
-        mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-        mkdir -p /frost/lower /frost/upper /frost/work /frost/merged /frost/persist /frost/probe
-        tmpfs_sz="512M"
-        if [ -f /proc/meminfo ]; then
-            mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-            if [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ] 2>/dev/null; then
-                half_mb=$((mem_kb / 2 / 1024))
-                [ "$half_mb" -lt 512 ] && half_mb=512
-                tmpfs_sz="${half_mb}M"
-            fi
-        fi
-        mount -t tmpfs -o "size=${tmpfs_sz}" tmpfs /frost/upper
+        shell_fallback
     fi
 else
     warn "/early_init not found, using shell fallback"
-    mkdir -p /proc /sys /dev
-    mount -t proc proc /proc
-    mount -t sysfs sysfs /sys
-    mount -t devtmpfs devtmpfs /dev
-    mkdir -p /frost/lower /frost/upper /frost/work /frost/merged /frost/persist /frost/probe
-    mount -t tmpfs -o size=512M tmpfs /frost/upper
+    shell_fallback
 fi
 
 # =============================================================================
@@ -72,8 +74,18 @@ log "Loading kernel modules..."
 KVER=$(uname -r)
 MODDIR="/lib/modules/${KVER}"
 
+# Check if a module is already loaded (e.g. by asm early_init)
+mod_loaded() {
+    local mod="$1"
+    # Normalize: hyphens become underscores in /proc/modules
+    local norm=$(echo "$mod" | tr '-' '_')
+    grep -q "^${norm} " /proc/modules 2>/dev/null
+}
+
 load_mod() {
     local mod="$1"
+    # Skip if already loaded by asm init
+    mod_loaded "$mod" && return 0
     modprobe "$mod" 2>/dev/null && return 0
     local ko=$(find "${MODDIR}" -name "${mod}.ko*" -o -name "$(echo "$mod" | tr '-' '_').ko*" 2>/dev/null | head -1)
     [ -n "$ko" ] && [ -f "$ko" ] && insmod "$ko" 2>/dev/null && return 0
@@ -81,14 +93,14 @@ load_mod() {
 }
 
 for mod in scsi_common scsi_mod t10-pi crct10dif_common crct10dif_generic crc-t10dif crc32c_generic crc64_rocksoft sd_mod sg \
-           libata ata_piix ata_generic ahci libahci \
+           libata ata_piix ata_generic libahci ahci \
            virtio virtio_ring virtio_pci virtio_pci_modern_dev virtio_pci_legacy_dev \
            virtio_blk virtio_scsi virtio_net \
            usb-common usbcore xhci-hcd xhci-pci ehci-hcd ehci-pci usb-storage \
-           overlay squashfs loop jbd2 mbcache crc16 ext4 crc32c_generic \
+           overlay squashfs loop jbd2 mbcache crc16 ext4 \
            vfat fat nls_cp437 nls_utf8 nls_ascii \
            hid usbhid hid-generic \
-           drm drm_kms_helper bochs-drm virtio-gpu simpledrm; do
+           drm drm_kms_helper bochs virtio-gpu; do
     load_mod "$mod" || true
 done
 ok "Modules loaded (kernel ${KVER})"
@@ -97,7 +109,9 @@ ok "Modules loaded (kernel ${KVER})"
 # Step 3: Device population
 # =============================================================================
 log "Populating devices..."
-echo /bin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+if [ -f /proc/sys/kernel/hotplug ]; then
+    echo /bin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+fi
 mdev -s 2>/dev/null || true
 
 # Retrigger uevents for USB/SCSI/PCI
@@ -227,14 +241,20 @@ else
     # Try ext4 containing rootfs.squashfs
     if mount -o ro "$ROOT_DEV" "$TMP_MNT" 2>/dev/null; then
         if [ -f "$TMP_MNT/rootfs.squashfs" ]; then
-            mount -t squashfs -o ro,loop "$TMP_MNT/rootfs.squashfs" /frost/lower
-            ok "Mounted squashfs from rootfs.squashfs"
-            mounted_squashfs=1
+            if mount -t squashfs -o ro,loop "$TMP_MNT/rootfs.squashfs" /frost/lower 2>/dev/null; then
+                ok "Mounted squashfs from rootfs.squashfs"
+                mounted_squashfs=1
+            else
+                warn "rootfs.squashfs present but mount failed"
+            fi
         else
             umount "$TMP_MNT"
-            mount -o ro "$ROOT_DEV" /frost/lower
-            ok "Mounted ext4 root directly"
-            mounted_squashfs=1
+            if mount -o ro "$ROOT_DEV" /frost/lower 2>/dev/null; then
+                ok "Mounted ext4 root directly"
+                mounted_squashfs=1
+            else
+                warn "ext4 root mount failed"
+            fi
         fi
     fi
 fi
@@ -266,7 +286,6 @@ for ld in /frost/lower/lib64/ld-linux-x86-64.so.2 \
     fi
 done
 
-python_ok=0
 if [ -n "$LD_LINUX" ] && [ -f "$PYBIN" ] && [ -f "$PY_INIT" ]; then
     # Set up library paths so Python can find its libs from the squashfs
     export LD_LIBRARY_PATH="/frost/lower/usr/lib/x86_64-linux-gnu:/frost/lower/lib/x86_64-linux-gnu:/frost/lower/lib64"
@@ -280,10 +299,17 @@ if [ -n "$LD_LINUX" ] && [ -f "$PYBIN" ] && [ -f "$PY_INIT" ]; then
     ok "Linker: $LD_LINUX"
     log "Running: $LD_LINUX $PYBIN $PY_INIT"
 
-    # Run Python init - if it succeeds it will exec switch_root and never return
+    # Run Python init - if it exits 0, overlay+persistence are ready
     "$LD_LINUX" "$PYBIN" "$PY_INIT" "$@"
     pyrc=$?
-    # If we get here, Python init failed to exec switch_root
+    if [ $pyrc -eq 0 ]; then
+        # Python set up everything successfully, do switch_root as PID 1
+        INIT_PATH="/sbin/init"
+        [ -f /frost/.init_path ] && INIT_PATH=$(cat /frost/.init_path)
+        ok "Python init complete, switching root (init=$INIT_PATH)"
+        exec switch_root /frost/merged "$INIT_PATH" "$@"
+    fi
+    # If we get here, Python init failed
     warn "Python init exited with code $pyrc"
 else
     if [ -z "$LD_LINUX" ]; then

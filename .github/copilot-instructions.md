@@ -1,5 +1,28 @@
 # frOSt - Frozen Operating System
 
+## Copilot Working Rules
+
+Use these rules for any code changes in this repository:
+
+- Treat `build.sh` as the single source of truth for system composition. Avoid adding parallel build paths unless explicitly requested.
+- Prefer minimal, targeted edits over broad refactors, especially in boot-critical files (`initramfs/init`, `initramfs/frost_init.py`, `boot/asm/early_init.asm`).
+- Preserve the hybrid boot handoff contract: shell discovers/mounts squashfs, Python handles overlay/persistence/switch_root.
+- Keep initramfs shell code BusyBox-ash safe:
+  - Do not use `local` outside function bodies.
+  - Use integer sleep values only.
+  - Handle errors explicitly; do not assume strict bash behavior.
+- When changing module loading, keep dependency order intact and prefer subsystem directory inclusion over single `.ko` additions.
+- Do not set `iwlwifi`/`iwlmvm` options that disable required AX201 init behavior (for example, avoid `enable_ini=0`).
+- For persistence changes, maintain compatibility with `/frost/persist/frost-persist.json` and both file + directory bind-mount handling.
+- Prefer quick validation paths before full rebuilds:
+  - `rebuild-pyinit.sh` for initramfs iteration
+  - `bash test.sh desktop` for end-to-end sanity checks
+- Keep deploy workflows platform-correct:
+  - Windows raw write path is `deploy.ps1`
+  - Linux raw write path is `deploy.sh`
+
+If a requested change conflicts with these constraints, call out the risk and suggest the safest alternative.
+
 ## Project Overview
 
 frOSt is a Debian bookworm-based Linux OS designed for USB deployment with overlay filesystem architecture. The system uses a read-only squashfs base + tmpfs transient layer + ext4 persistent bind mounts. Everything resets on disconnect except user-defined persistent paths. Single build script (`build.sh`) is the source of truth for the entire OS.

@@ -49,8 +49,104 @@ alias overlay='frost-overlay layers'
 # ── Colors for ls ─────────────────────────────────────
 export LS_COLORS='di=1;36:ln=35:so=32:pi=33:ex=1;32:bd=34;46:cd=34;43:su=30;41:sg=30;46:tw=30;42:ow=34;43'
 
-# ── Neofetch on first login ───────────────────────────
-if [ -z "$FROST_GREETED" ] && command -v neofetch >/dev/null 2>&1; then
+# ── frOSt welcome banner on first login ───────────────
+if [ -z "$FROST_GREETED" ]; then
     export FROST_GREETED=1
-    neofetch --config /etc/frost/neofetch.conf 2>/dev/null || neofetch
+    echo ""
+echo -e "\033[1;36m   ███╗   ██╗███████╗██╗   ██╗███████╗██████╗\033[0m"
+echo -e "\033[1;36m   ████╗  ██║██╔════╝██║   ██║██╔════╝██╔══██╗\033[0m"
+echo -e "\033[1;36m   ██╔██╗ ██║█████╗  ██║   ██║█████╗  ██████╔╝\033[0m"
+echo -e "\033[1;36m   ██║╚██╗██║██╔══╝  ╚██╗ ██╔╝██╔══╝  ██╔══██╗\033[0m"
+echo -e "\033[1;36m   ██║ ╚████║███████╗ ╚████╔╝ ███████╗██║  ██║\033[0m"
+echo -e "\033[1;36m   ╚═╝  ╚═══╝╚══════╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝\033[0m"
+echo ""
+echo -e "\033[1;36m   ██╗      ██████╗ ███████╗███████╗\033[0m"
+echo -e "\033[1;36m   ██║     ██╔═══██╗██╔════╝██╔════╝\033[0m"
+echo -e "\033[1;36m   ██║     ██║   ██║███████╗█████╗  \033[0m"
+echo -e "\033[1;36m   ██║     ██║   ██║╚════██║██╔══╝  \033[0m"
+echo -e "\033[1;36m   ███████╗╚██████╔╝███████║███████╗\033[0m"
+echo -e "\033[1;36m   ╚══════╝ ╚═════╝ ╚══════╝╚══════╝\033[0m"
+echo ""
+echo -e "\033[1;36m   ██╗   ██╗ ██████╗ ██╗   ██╗██████╗\033[0m"
+echo -e "\033[1;36m   ╚██╗ ██╔╝██╔═══██╗██║   ██║██╔══██╗\033[0m"
+echo -e "\033[1;36m    ╚████╔╝ ██║   ██║██║   ██║██████╔╝\033[0m"
+echo -e "\033[1;36m     ╚██╔╝  ██║   ██║██║   ██║██╔══██╗\033[0m"
+echo -e "\033[1;36m      ██║   ╚██████╔╝╚██████╔╝██║  ██║\033[0m"
+echo -e "\033[1;36m      ╚═╝    ╚═════╝  ╚═════╝ ╚═╝  ╚═╝\033[0m"
+echo ""
+echo -e "\033[1;36m   ███████╗███╗   ███╗██╗██╗     ███████╗\033[0m"
+echo -e "\033[1;36m   ██╔════╝████╗ ████║██║██║     ██╔════╝\033[0m"
+echo -e "\033[1;36m   ███████╗██╔████╔██║██║██║     █████╗  \033[0m"
+echo -e "\033[1;36m   ╚════██║██║╚██╔╝██║██║██║     ██╔══╝  \033[0m"
+echo -e "\033[1;36m   ███████║██║ ╚═╝ ██║██║███████╗███████╗\033[0m"
+echo -e "\033[1;36m   ╚══════╝╚═╝     ╚═╝╚═╝╚══════╝╚══════╝\033[0m"
+echo ""
+    echo -e "  \033[1;37m Fucking Retarded Operating System tech v3.0\033[0m"
+    echo -e "  \033[0;36m Overlay: squashfs RO + tmpfs RW + ext4 persist\033[0m"
+    echo -e "  \033[0;36m © 2026 Autism Induced Jihad\033[0m"
+    echo -e "  \033[0;31m FUCK YOU IF YOU STEAL MY CODE\033[0m"
+    echo -e "  \033[0;90m──────────────────────────────────────────────────\033[0m"
+    echo ""
+    # System info summary
+    echo -e "  \033[0;36m▸ Kernel:\033[0m  $(uname -r)"
+    echo -e "  \033[0;36m▸ Uptime:\033[0m  $(uptime -p 2>/dev/null | sed 's/up //' || echo 'N/A')"
+    echo -e "  \033[0;36m▸ Memory:\033[0m  $(free -h 2>/dev/null | awk '/^Mem/{print $3 " / " $2}' || echo 'N/A')"
+    echo -e "  \033[0;36m▸ Disk:  \033[0m  $(df -h / 2>/dev/null | awk 'NR==2{print $3 " / " $2 " (" $5 ")"}' || echo 'N/A')"
+    echo ""
+    echo -e "  \033[0;90m[*] Type '\033[1;36mstatus\033[0;90m' for overlay info  '\033[1;36mpersist\033[0;90m' for persistence\033[0m"
+    echo ""
+       echo ""
+echo -e "\033[1;36m /$$$$$$$$ /$$   /$$ /$$$$$$$ \033[0m"
+echo -e "\033[1;36m|__  $$__/| $$$ | $$| $$__  $$\033[0m"
+echo -e "\033[1;36m   | $$   | $$$$| $$| $$  \ $$\033[0m"
+echo -e "\033[1;36m   | $$   | $$ $$ $$| $$  | $$\033[0m"
+echo -e "\033[1;36m   | $$   | $$  $$$$| $$  | $$\033[0m"
+echo -e "\033[1;36m   | $$   | $$\  $$$| $$  | $$\033[0m"
+echo -e "\033[1;36m   | $$   | $$ \  $$| $$$$$$$/\033[0m"
+echo -e "\033[1;36m   |__/   |__/  \__/|_______/ \033[0m"
+echo ""
 fi
+
+# ── Hacker-themed functions ───────────────────────────
+# Matrix-style text rain (optional terminal effect)
+matrix() {
+    echo -e "\033[1;32m"
+    tr -c "[:digit:]" " " < /dev/urandom | dd cbs=$COLUMNS conv=unblock 2>/dev/null | TERM=linux head -c $((COLUMNS * LINES))
+    echo -e "\033[0m"
+}
+
+# System status display
+status() {
+    echo -e "\033[1;36m▓▓▓ SYSTEM STATUS ▓▓▓\033[0m"
+    echo -e "\033[0;36m▸ Uptime:\033[0m $(uptime -p | sed 's/up //')"
+    echo -e "\033[0;36m▸ Load:\033[0m $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
+    echo -e "\033[0;36m▸ Memory:\033[0m $(free -h | grep '^Mem' | awk '{print $3 " / " $2}')"
+    echo -e "\033[0;36m▸ Storage:\033[0m $(df -h / | tail -1 | awk '{print $3 " / " $2}')"
+    echo -e "\033[0;36m▸ Timezone:\033[0m $(date +%Z)"
+    echo ""
+}
+
+# Banner display function
+banner() {
+    clear
+    echo ""
+    echo -e "\033[1;34m   +-------------------------------------------------+\033[0m"
+    echo -e "\033[1;34m   |\033[1;36m  *  frOSt - init exited with code 1488  *         \033[1;34m|\033[0m"
+    echo -e "\033[1;34m   +-------------------------------------------------+\033[0m"
+    echo ""
+   echo ""
+echo -e "\033[1;36m /$$$$$$$$ /$$   /$$ /$$$$$$$ \033[0m"
+echo -e "\033[1;36m|__  $$__/| $$$ | $$| $$__  $$\033[0m"
+echo -e "\033[1;36m   | $$   | $$$$| $$| $$  \ $$\033[0m"
+echo -e "\033[1;36m   | $$   | $$ $$ $$| $$  | $$\033[0m"
+echo -e "\033[1;36m   | $$   | $$  $$$$| $$  | $$\033[0m"
+echo -e "\033[1;36m   | $$   | $$\  $$$| $$  | $$\033[0m"
+echo -e "\033[1;36m   | $$   | $$ \  $$| $$$$$$$/\033[0m"
+echo -e "\033[1;36m   |__/   |__/  \__/|_______/ \033[0m"
+echo ""
+}
+
+# Hacker-themed commands
+alias scan="echo -e '\033[1;32m[*] System scan initiated...\033[0m' && sleep 1 && neofetch"
+alias matrix="bash -c 'echo -e \"\033[1;32m\" && head -c 1000 /dev/urandom | tr -cd \"01\" && echo -e \"\033[0m\"'"
+alias hack='figlet -f banner "HACKER" 2>/dev/null || echo "HACKER MODE"'

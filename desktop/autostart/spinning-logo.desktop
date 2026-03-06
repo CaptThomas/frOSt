@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=frOSt Spinning Logo
+Comment=Transparent spinning frOSt desktop logo overlay
+Exec=/usr/local/bin/frost-start-logo.sh
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
+X-XFCE-Autostart-Override=true
+OnlyShowIn=XFCE;

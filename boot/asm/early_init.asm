@@ -6,13 +6,15 @@
 ;
 ; Responsibilities:
 ;   1. Mount /proc, /sys, /dev (devtmpfs)
-;   2. Detect RAM, calculate tmpfs size
-;   3. Create overlay directory structure
-;   4. Mount tmpfs for transient overlay layer
-;   5. Set up /dev/console, /dev/null, /dev/zero
-;   6. Configure kernel hotplug for mdev
-;   7. Scan /sys/block and report block devices
-;   8. Exit 0 -> hand off to shell bootstrap -> Python frost_init
+;   2. Detect kernel version (for module paths)
+;   3. Detect RAM, calculate tmpfs size
+;   4. Create overlay directory structure
+;   5. Mount tmpfs for transient overlay layer
+;   6. Set up /dev/console, /dev/null, /dev/zero, /dev/tty
+;   7. Configure kernel hotplug for mdev
+;   8. Load critical kernel modules via finit_module(2)
+;   9. Scan /sys/block and report block devices
+;  10. Exit 0 -> hand off to shell bootstrap -> Python frost_init
 ; =============================================================================
 
 BITS 64
@@ -21,35 +23,26 @@ section .text
 global _start
 
 ; ── Syscall numbers (x86-64 Linux) ──
-%define SYS_read        0
 %define SYS_write       1
 %define SYS_open        2
 %define SYS_close       3
-%define SYS_stat        4
-%define SYS_mmap        9
-%define SYS_ioctl       16
-%define SYS_mount       165
+%define SYS_uname       63
 %define SYS_mkdir       83
-%define SYS_mknod       133
-%define SYS_getdents64  217
-%define SYS_reboot      169
 %define SYS_sysinfo     99
+%define SYS_mknod       133
+%define SYS_mount       165
+%define SYS_getdents64  217
+%define SYS_finit_module 313
 %define SYS_exit        60
-%define SYS_execve      59
-%define SYS_chdir       80
-%define SYS_symlink     88
 
 ; ── Mount flags ──
 %define MS_NOSUID       2
-%define MS_NODEV        4
 %define MS_NOEXEC       8
 
 ; ── Open flags ──
 %define O_RDONLY        0
 %define O_WRONLY        1
-%define O_RDWR          2
-%define O_CREAT         0x40
-%define O_TRUNC         0x200
+%define O_CLOEXEC       0x80000
 
 ; ── mknod modes ──
 %define S_IFCHR         0o020000
@@ -71,34 +64,55 @@ _start:
     call    sys_write
 
     ; ── Step 1: Mount virtual filesystems ──
-    call    mount_proc
+    lea     rdi, [rel fs_proc]
+    lea     rsi, [rel path_proc]
+    lea     rdx, [rel fs_proc]
+    xor     r10d, r10d
+    xor     r8d, r8d
+    call    do_mount
     test    eax, eax
     jnz     .fail_proc
 
-    call    mount_sysfs
+    lea     rdi, [rel fs_sysfs]
+    lea     rsi, [rel path_sys]
+    lea     rdx, [rel fs_sysfs]
+    xor     r10d, r10d
+    xor     r8d, r8d
+    call    do_mount
     test    eax, eax
     jnz     .fail_sysfs
 
-    call    mount_devtmpfs
+    lea     rdi, [rel fs_devtmpfs]
+    lea     rsi, [rel path_dev]
+    lea     rdx, [rel fs_devtmpfs]
+    mov     r10d, MS_NOSUID | MS_NOEXEC
+    xor     r8d, r8d
+    call    do_mount
     test    eax, eax
     jnz     .fail_devtmpfs
 
-    ; ── Step 2: Detect RAM ──
+    ; ── Step 2: Detect kernel version ──
+    call    detect_kver
+
+    ; ── Step 3: Detect RAM ──
     call    detect_memory
 
-    ; ── Step 3: Create overlay directories ──
+    ; ── Step 4: Create overlay directories ──
     call    create_overlay_dirs
 
-    ; ── Step 4: Mount tmpfs overlay ──
+    ; ── Step 5: Mount tmpfs overlay ──
     call    mount_tmpfs_overlay
 
-    ; ── Step 5: Create essential device nodes ──
+    ; ── Step 6: Create essential device nodes ──
     call    create_dev_nodes
 
-    ; ── Step 6: Configure mdev hotplug ──
+    ; ── Step 7: Configure mdev hotplug ──
     call    setup_mdev
 
-    ; ── Step 7: Scan block devices ──
+    ; ── Step 8: Load critical kernel modules ──
+    call    load_modules
+
+    ; ── Step 9: Scan block devices ──
     call    detect_block_devices
 
     ; ── Done ──
@@ -132,77 +146,135 @@ _start:
 
 
 ; =============================================================================
-; Mount /proc
+; Generic mount: mkdir target then mount(source, target, fstype, flags, data)
+; Args: rdi=source, rsi=target, rdx=fstype, r10=flags, r8=data
+; Returns: mount result in eax (0=success, negative=-errno)
 ; =============================================================================
-mount_proc:
-    push    rbx
-    lea     rdi, [rel path_proc]
+do_mount:
+    push    rdi
+    push    rsi
+    push    rdx
+    push    r10
+    push    r8
+    mov     rdi, rsi                    ; mkdir(target, 0755)
     mov     esi, 0o755
     mov     eax, SYS_mkdir
-    syscall
-    lea     rdi, [rel fs_proc]
-    lea     rsi, [rel path_proc]
-    lea     rdx, [rel fs_proc]
-    xor     r10d, r10d
-    xor     r8d, r8d
+    syscall                             ; ignore result (EEXIST is fine)
+    pop     r8
+    pop     r10
+    pop     rdx
+    pop     rsi
+    pop     rdi
     mov     eax, SYS_mount
     syscall
+    ret
+
+; =============================================================================
+; Detect kernel version via uname(2)
+; Stores release string in kver_buf, builds module base path in modpath_buf
+; =============================================================================
+detect_kver:
+    push    rbx
+    sub     rsp, 400                    ; struct utsname = 6 * 65 = 390, pad to 400
+
+    lea     rdi, [rsp]
+    mov     eax, SYS_uname
+    syscall
+    test    eax, eax
+    jnz     .kver_fail
+
+    ; release is at offset 130 (after sysname[65] + nodename[65])
+    lea     rsi, [rsp + 130]
+
+    ; Copy release to kver_buf
+    lea     rdi, [rel kver_buf]
+    xor     ecx, ecx
+.kver_copy:
+    mov     al, [rsi + rcx]
+    mov     [rdi + rcx], al
+    test    al, al
+    jz      .kver_done
+    inc     ecx
+    cmp     ecx, 64
+    jl      .kver_copy
+    mov     byte [rdi + rcx], 0         ; ensure null-terminated
+.kver_done:
+    mov     [rel kver_len], cl
+
+    ; Build "/lib/modules/<kver>/kernel/" in modpath_buf
+    lea     rdi, [rel modpath_buf]
+    lea     rsi, [rel modpath_prefix]   ; "/lib/modules/"
+.mp_cp1:
+    lodsb
+    test    al, al
+    jz      .mp_kver
+    stosb
+    jmp     .mp_cp1
+.mp_kver:
+    lea     rsi, [rel kver_buf]
+.mp_cp2:
+    lodsb
+    test    al, al
+    jz      .mp_suffix
+    stosb
+    jmp     .mp_cp2
+.mp_suffix:
+    mov     dword [rdi], '/ker'
+    add     rdi, 4
+    mov     dword [rdi], 'nel/'
+    add     rdi, 4
+    mov     byte [rdi], 0
+
+    ; Save modpath length
+    lea     rax, [rel modpath_buf]
+    sub     rdi, rax
+    mov     [rel modpath_len], edi
+
+    ; Print kernel version
+    mov     rdi, STDOUT
+    lea     rsi, [rel msg_kver_prefix]
+    mov     rdx, msg_kver_prefix_len
+    call    sys_write
+
+    movzx   edx, byte [rel kver_len]
+    lea     rsi, [rel kver_buf]
+    mov     rdi, STDOUT
+    call    sys_write
+
+    mov     rdi, STDOUT
+    lea     rsi, [rel msg_newline]
+    mov     rdx, 1
+    call    sys_write
+
+    add     rsp, 400
+    pop     rbx
+    ret
+
+.kver_fail:
+    mov     byte [rel kver_buf], 0
+    mov     byte [rel kver_len], 0
+    add     rsp, 400
     pop     rbx
     ret
 
 ; =============================================================================
-; Mount /sys
-; =============================================================================
-mount_sysfs:
-    push    rbx
-    lea     rdi, [rel path_sys]
-    mov     esi, 0o755
-    mov     eax, SYS_mkdir
-    syscall
-    lea     rdi, [rel fs_sysfs]
-    lea     rsi, [rel path_sys]
-    lea     rdx, [rel fs_sysfs]
-    xor     r10d, r10d
-    xor     r8d, r8d
-    mov     eax, SYS_mount
-    syscall
-    pop     rbx
-    ret
-
-; =============================================================================
-; Mount /dev (devtmpfs)
-; =============================================================================
-mount_devtmpfs:
-    push    rbx
-    lea     rdi, [rel path_dev]
-    mov     esi, 0o755
-    mov     eax, SYS_mkdir
-    syscall
-    lea     rdi, [rel fs_devtmpfs]
-    lea     rsi, [rel path_dev]
-    lea     rdx, [rel fs_devtmpfs]
-    mov     r10d, MS_NOSUID | MS_NOEXEC
-    xor     r8d, r8d
-    mov     eax, SYS_mount
-    syscall
-    pop     rbx
-    ret
-
-; =============================================================================
-; Detect total system memory via sysinfo
+; Detect total system memory via sysinfo(2)
 ; =============================================================================
 detect_memory:
     push    rbx
-    sub     rsp, 128
+    sub     rsp, 128                    ; struct sysinfo
 
-    mov     rdi, rsp
+    lea     rdi, [rsp]
     mov     eax, SYS_sysinfo
     syscall
     test    eax, eax
     jnz     .mem_fail
 
-    mov     rax, [rsp + 32]             ; sysinfo.totalram
-    mov     ecx, [rsp + 104]            ; sysinfo.mem_unit
+    ; struct sysinfo x86-64 offsets:
+    ;   +32: totalram (unsigned long)
+    ;   +104: mem_unit (unsigned int)
+    mov     rax, [rsp + 32]
+    mov     ecx, [rsp + 104]
     imul    rax, rcx
     mov     [rel total_ram], rax
 
@@ -221,12 +293,12 @@ detect_memory:
     mov     rdx, msg_mb_suffix_len
     call    sys_write
 
-    mov     rax, [rel total_ram]
     add     rsp, 128
     pop     rbx
     ret
+
 .mem_fail:
-    mov     rax, 512 * 1024 * 1024
+    mov     rax, 512 * 1024 * 1024      ; default 512 MB
     mov     [rel total_ram], rax
     add     rsp, 128
     pop     rbx
@@ -236,10 +308,6 @@ detect_memory:
 ; Create overlay directory tree
 ; =============================================================================
 create_overlay_dirs:
-    push    rbx
-
-    ; Create all directories: /frost, /frost/lower, /frost/upper,
-    ; /frost/work, /frost/merged, /frost/persist, /frost/probe
     %macro mkdir_path 1
         lea     rdi, [rel %1]
         mov     esi, 0o755
@@ -254,8 +322,6 @@ create_overlay_dirs:
     mkdir_path path_merged
     mkdir_path path_persist
     mkdir_path path_probe
-
-    pop     rbx
     ret
 
 ; =============================================================================
@@ -267,33 +333,20 @@ mount_tmpfs_overlay:
 
     ; Calculate 50% of RAM in MB
     mov     rax, [rel total_ram]
-    shr     rax, 21                     ; bytes / 2 / 1048576 = MB
-
-    ; Enforce minimum 512MB
+    shr     rax, 21                     ; bytes / 2 / 1048576 = 50% in MB
     cmp     rax, 512
     jge     .tmpfs_size_ok
-    mov     rax, 512
+    mov     eax, 512
 .tmpfs_size_ok:
+    mov     rbx, rax                    ; save size
 
-    ; Build option string "size=XXXM" on stack
+    ; Build "size=XXXM" on stack
     lea     rdi, [rsp]
-    lea     rsi, [rel tmpfs_size_prefix]
-    mov     ecx, 5
-.cp:
-    mov     al, [rsi]
-    mov     [rdi], al
-    inc     rsi
-    inc     rdi
-    dec     ecx
-    jnz     .cp
+    mov     dword [rdi], 'size'
+    mov     byte [rdi+4], '='
+    add     rdi, 5
 
-    ; Recalculate size for conversion
-    mov     rax, [rel total_ram]
-    shr     rax, 21
-    cmp     rax, 512
-    jge     .conv_ok
-    mov     rax, 512
-.conv_ok:
+    mov     rax, rbx
     call    uint_to_ascii
     mov     byte [rdi], 'M'
     mov     byte [rdi+1], 0
@@ -317,69 +370,52 @@ mount_tmpfs_overlay:
     ret
 
 ; =============================================================================
-; Create essential device nodes: /dev/console, /dev/null, /dev/zero, /dev/tty
+; Create essential device nodes (data-driven)
 ; =============================================================================
 create_dev_nodes:
     push    rbx
-
-    ; /dev/console  c 5 1  mode 0622
-    lea     rdi, [rel dev_console]
-    mov     esi, S_IFCHR | 0o622
-    mov     edx, (5 << 8) | 1           ; makedev(5, 1)
+    push    r12
+    lea     r12, [rel devnode_table]
+.devnode_loop:
+    mov     rdi, [r12]                  ; path pointer
+    test    rdi, rdi
+    jz      .devnode_done
+    mov     esi, [r12 + 8]              ; mode
+    mov     edx, [r12 + 12]             ; dev number
     mov     eax, SYS_mknod
     syscall
-
-    ; /dev/null     c 1 3  mode 0666
-    lea     rdi, [rel dev_null]
-    mov     esi, S_IFCHR | 0o666
-    mov     edx, (1 << 8) | 3
-    mov     eax, SYS_mknod
-    syscall
-
-    ; /dev/zero     c 1 5  mode 0666
-    lea     rdi, [rel dev_zero]
-    mov     esi, S_IFCHR | 0o666
-    mov     edx, (1 << 8) | 5
-    mov     eax, SYS_mknod
-    syscall
-
-    ; /dev/tty      c 5 0  mode 0666
-    lea     rdi, [rel dev_tty]
-    mov     esi, S_IFCHR | 0o666
-    mov     edx, (5 << 8) | 0
-    mov     eax, SYS_mknod
-    syscall
-
+    add     r12, 16                     ; next entry
+    jmp     .devnode_loop
+.devnode_done:
+    pop     r12
     pop     rbx
     ret
 
 ; =============================================================================
-; Set up mdev as hotplug handler and run initial device scan
+; Set up mdev as hotplug handler
 ; =============================================================================
 setup_mdev:
     push    rbx
 
-    ; Write "/bin/mdev" to /proc/sys/kernel/hotplug
     lea     rdi, [rel path_hotplug]
     mov     esi, O_WRONLY
     mov     eax, SYS_open
     syscall
     test    eax, eax
-    js      .mdev_skip_hotplug
-    mov     ebx, eax                    ; save fd
+    js      .mdev_done
+    mov     ebx, eax
 
+    mov     edi, ebx
     lea     rsi, [rel mdev_path]
     mov     edx, mdev_path_len
-    mov     edi, ebx
     mov     eax, SYS_write
     syscall
 
     mov     edi, ebx
     mov     eax, SYS_close
     syscall
-.mdev_skip_hotplug:
 
-    ; Print status
+.mdev_done:
     mov     rdi, STDOUT
     lea     rsi, [rel msg_mdev]
     mov     rdx, msg_mdev_len
@@ -389,11 +425,133 @@ setup_mdev:
     ret
 
 ; =============================================================================
-; Detect block devices by reading /sys/block directory entries
+; Load critical kernel modules via finit_module(2)
+;
+; Iterates a null-terminated table of relative .ko paths and loads each via:
+;   fd = open("/lib/modules/<kver>/kernel/<path>", O_RDONLY|O_CLOEXEC)
+;   finit_module(fd, "", 0)
+;   close(fd)
+;
+; Falls back to .ko.xz extension if .ko not found (kernel decompresses).
+; Silently ignores failures (builtin or missing modules).
+; =============================================================================
+load_modules:
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+
+    ; Skip if kver detection failed
+    cmp     byte [rel kver_buf], 0
+    je      .lm_skip
+
+    mov     rdi, STDOUT
+    lea     rsi, [rel msg_loading_mods]
+    mov     rdx, msg_loading_mods_len
+    call    sys_write
+
+    xor     r15d, r15d                  ; loaded count
+    lea     r14, [rel mod_table]        ; current table entry
+
+.lm_next_entry:
+    cmp     byte [r14], 0               ; end of table?
+    je      .lm_print_count
+
+    ; Build full path: modpath_buf + current entry -> pathbuild_buf
+    lea     rdi, [rel pathbuild_buf]
+    lea     rsi, [rel modpath_buf]
+    mov     ecx, [rel modpath_len]
+    rep     movsb                       ; fast copy of known-length base path
+    mov     rsi, r14
+.lm_cp_rel_loop:
+    lodsb
+    stosb                               ; copy including null terminator
+    test    al, al
+    jnz     .lm_cp_rel_loop
+    mov     r12, rsi                    ; r12 -> next table entry
+
+    ; Try open .ko
+    lea     rdi, [rel pathbuild_buf]
+    mov     esi, O_RDONLY | O_CLOEXEC
+    mov     eax, SYS_open
+    syscall
+    test    eax, eax
+    jns     .lm_finit
+
+    ; Try .ko.xz: find the null terminator and append .xz
+    lea     rdi, [rel pathbuild_buf]
+    xor     ecx, ecx
+.lm_find_end:
+    cmp     byte [rdi + rcx], 0
+    je      .lm_append_xz
+    inc     ecx
+    jmp     .lm_find_end
+.lm_append_xz:
+    mov     byte [rdi + rcx], '.'
+    mov     byte [rdi + rcx + 1], 'x'
+    mov     byte [rdi + rcx + 2], 'z'
+    mov     byte [rdi + rcx + 3], 0
+
+    lea     rdi, [rel pathbuild_buf]
+    mov     esi, O_RDONLY | O_CLOEXEC
+    mov     eax, SYS_open
+    syscall
+    test    eax, eax
+    js      .lm_advance                 ; not found, skip
+
+.lm_finit:
+    mov     ebx, eax                    ; save fd
+    mov     edi, eax                    ; fd
+    lea     rsi, [rel mod_empty_params] ; ""
+    xor     edx, edx                    ; flags=0
+    mov     eax, SYS_finit_module
+    syscall
+    mov     r13d, eax                   ; save result
+
+    mov     edi, ebx                    ; close fd
+    mov     eax, SYS_close
+    syscall
+
+    test    r13d, r13d
+    jnz     .lm_advance
+    inc     r15d                        ; success
+
+.lm_advance:
+    mov     r14, r12
+    jmp     .lm_next_entry
+
+.lm_print_count:
+    mov     rdi, STDOUT
+    lea     rsi, [rel msg_mod_prefix]
+    mov     rdx, msg_mod_prefix_len
+    call    sys_write
+
+    mov     eax, r15d
+    call    print_decimal
+
+    mov     rdi, STDOUT
+    lea     rsi, [rel msg_mod_suffix]
+    mov     rdx, msg_mod_suffix_len
+    call    sys_write
+
+.lm_skip:
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; =============================================================================
+; Detect block devices by scanning /sys/block
 ; =============================================================================
 detect_block_devices:
     push    rbx
     push    r12
+    push    r13
+    push    r14
+    push    r15
     sub     rsp, 1088
 
     mov     rdi, STDOUT
@@ -407,51 +565,50 @@ detect_block_devices:
     syscall
     test    eax, eax
     js      .scan_done
-    mov     r12d, eax
+    mov     r12d, eax                   ; fd
+    lea     r13, [rsp]                  ; buffer base (callee-saved)
 
 .read_loop:
     mov     edi, r12d
-    lea     rsi, [rsp]
+    mov     rsi, r13
     mov     edx, 1088
     mov     eax, SYS_getdents64
     syscall
     test    eax, eax
     jle     .close_dir
 
-    xor     ebx, ebx
+    mov     r14d, eax                   ; total bytes (callee-saved)
+    xor     ebx, ebx                    ; current offset (callee-saved)
 .next_ent:
-    cmp     ebx, eax
+    cmp     ebx, r14d
     jge     .read_loop
 
-    movzx   ecx, word [rsp + rbx + 16]
-    lea     rdi, [rsp + rbx + 19]
+    ; linux_dirent64: d_reclen at +16, d_name at +19
+    movzx   r15d, word [r13 + rbx + 16] ; d_reclen (callee-saved, survives calls)
 
-    ; Skip . and .. and loop/ram devices
-    cmp     byte [rdi], '.'
+    ; Skip . and ..
+    cmp     byte [r13 + rbx + 19], '.'
     je      .skip_ent
-    cmp     byte [rdi], 'l'             ; skip loop*
+    ; Skip loop*
+    cmp     byte [r13 + rbx + 19], 'l'
     jne     .not_loop
-    cmp     byte [rdi+1], 'o'
+    cmp     byte [r13 + rbx + 20], 'o'
     je      .skip_ent
 .not_loop:
-    cmp     byte [rdi], 'r'             ; skip ram*
-    jne     .not_ram
-    cmp     byte [rdi+1], 'a'
+    ; Skip ram*
+    cmp     byte [r13 + rbx + 19], 'r'
+    jne     .print_dev
+    cmp     byte [r13 + rbx + 20], 'a'
     je      .skip_ent
-.not_ram:
 
+.print_dev:
     ; Print "  -> /dev/<name>\n"
-    push    rax
-    push    rcx
-    push    rbx
     mov     rdi, STDOUT
     lea     rsi, [rel msg_dev_prefix]
     mov     rdx, msg_dev_prefix_len
     call    sys_write
 
-    pop     rbx
-    push    rbx
-    lea     rsi, [rsp + 24 + rbx + 19]
+    lea     rsi, [r13 + rbx + 19]       ; d_name (r13, rbx callee-saved)
     xor     edx, edx
 .slen:
     cmp     byte [rsi + rdx], 0
@@ -461,16 +618,14 @@ detect_block_devices:
 .pname:
     mov     rdi, STDOUT
     call    sys_write
+
     mov     rdi, STDOUT
     lea     rsi, [rel msg_newline]
     mov     rdx, 1
     call    sys_write
-    pop     rbx
-    pop     rcx
-    pop     rax
 
 .skip_ent:
-    add     ebx, ecx
+    add     ebx, r15d
     jmp     .next_ent
 
 .close_dir:
@@ -479,12 +634,15 @@ detect_block_devices:
     syscall
 .scan_done:
     add     rsp, 1088
+    pop     r15
+    pop     r14
+    pop     r13
     pop     r12
     pop     rbx
     ret
 
 ; =============================================================================
-; Utility: sys_write wrapper
+; Utility: sys_write(rdi=fd, rsi=buf, rdx=len)
 ; =============================================================================
 sys_write:
     mov     eax, SYS_write
@@ -492,7 +650,7 @@ sys_write:
     ret
 
 ; =============================================================================
-; Utility: print unsigned decimal number (rax) to stdout
+; Utility: print unsigned decimal (rax) to stdout
 ; =============================================================================
 print_decimal:
     push    rbx
@@ -518,7 +676,7 @@ print_decimal:
     jmp     .pd_conv
 .pd_print:
     inc     rdi
-    lea     rsi, [rdi]
+    mov     rsi, rdi
     lea     rcx, [rsp + 23]
     sub     rcx, rdi
     mov     rdx, rcx
@@ -569,18 +727,18 @@ uint_to_ascii:
 
 
 ; =============================================================================
-; Data Section
+; Data Section - no trailing null bytes in length calculations
 ; =============================================================================
 section .data
 
-; ── Boot banner (cyan frOSt ASCII art with snowflake accents) ──
+; ── Boot banner ──
 msg_banner:
     db 10
     db 0x1B, '[1;34m'
-    db '   ┌──────────────────────────────────────────────┐', 10
-    db '   │', 0x1B, '[1;36m'
-    db '  ❄  frOSt Kernel Bootstrap  ❄                ', 0x1B, '[1;34m', '│', 10
-    db '   └──────────────────────────────────────────────┘', 10
+    db '   +-------------------------------------------------+', 10
+    db '   |', 0x1B, '[1;36m'
+    db '  *  frOSt Kernel Bootstrap  *                  ', 0x1B, '[1;34m', '|', 10
+    db '   +-------------------------------------------------+', 10
     db 0x1B, '[0m', 10
     db 0x1B, '[1;36m'
     db '   :::::::::: :::::::::   ::::::::   ::::::::  ::::::::::', 10
@@ -593,48 +751,64 @@ msg_banner:
     db 0x1B, '[0m', 10
     db 0x1B, '[1;37m', '  Frozen Operating System v3.0', 0x1B, '[0m', 10
     db 0x1B, '[0;36m', '  x86-64 Assembly + Python Init', 0x1B, '[0m', 10
-    db '  ──────────────────────────────────────────', 10, 0
+    db '  ------------------------------------------', 10
 msg_banner_len equ $ - msg_banner
 
 msg_done:
-    db 0x1B, '[1;32m', '[frOSt] Assembly init complete -> shell bootstrap', 0x1B, '[0m', 10, 0
+    db 0x1B, '[1;32m', '[frOSt] Assembly init complete -> shell bootstrap', 0x1B, '[0m', 10
 msg_done_len equ $ - msg_done
 
 msg_proc_fail:
-    db 0x1B, '[1;31m', '[frOSt] FATAL: Cannot mount /proc', 0x1B, '[0m', 10, 0
+    db 0x1B, '[1;31m', '[frOSt] FATAL: Cannot mount /proc', 0x1B, '[0m', 10
 msg_proc_fail_len equ $ - msg_proc_fail
 
 msg_sysfs_fail:
-    db 0x1B, '[1;31m', '[frOSt] FATAL: Cannot mount /sys', 0x1B, '[0m', 10, 0
+    db 0x1B, '[1;31m', '[frOSt] FATAL: Cannot mount /sys', 0x1B, '[0m', 10
 msg_sysfs_fail_len equ $ - msg_sysfs_fail
 
 msg_devtmpfs_fail:
-    db 0x1B, '[1;31m', '[frOSt] FATAL: Cannot mount /dev', 0x1B, '[0m', 10, 0
+    db 0x1B, '[1;31m', '[frOSt] FATAL: Cannot mount /dev', 0x1B, '[0m', 10
 msg_devtmpfs_fail_len equ $ - msg_devtmpfs_fail
 
 msg_ram_prefix:
-    db 0x1B, '[0;37m', '[frOSt] RAM: ', 0x1B, '[1;37m', 0
+    db 0x1B, '[0;37m', '[frOSt] RAM: ', 0x1B, '[1;37m'
 msg_ram_prefix_len equ $ - msg_ram_prefix
 
 msg_mb_suffix:
-    db ' MB', 0x1B, '[0m', 10, 0
+    db ' MB', 0x1B, '[0m', 10
 msg_mb_suffix_len equ $ - msg_mb_suffix
 
 msg_tmpfs_ok:
-    db 0x1B, '[0;37m', '[frOSt] Transient overlay tmpfs mounted', 0x1B, '[0m', 10, 0
+    db 0x1B, '[0;37m', '[frOSt] Transient overlay tmpfs mounted', 0x1B, '[0m', 10
 msg_tmpfs_ok_len equ $ - msg_tmpfs_ok
 
 msg_scanning:
-    db 0x1B, '[0;37m', '[frOSt] Scanning block devices...', 0x1B, '[0m', 10, 0
+    db 0x1B, '[0;37m', '[frOSt] Scanning block devices...', 0x1B, '[0m', 10
 msg_scanning_len equ $ - msg_scanning
 
 msg_dev_prefix:
-    db '  -> /dev/', 0
+    db '  -> /dev/'
 msg_dev_prefix_len equ $ - msg_dev_prefix
 
 msg_mdev:
-    db 0x1B, '[0;37m', '[frOSt] mdev hotplug configured', 0x1B, '[0m', 10, 0
+    db 0x1B, '[0;37m', '[frOSt] mdev hotplug configured', 0x1B, '[0m', 10
 msg_mdev_len equ $ - msg_mdev
+
+msg_kver_prefix:
+    db 0x1B, '[0;37m', '[frOSt] Kernel: ', 0x1B, '[1;37m'
+msg_kver_prefix_len equ $ - msg_kver_prefix
+
+msg_loading_mods:
+    db 0x1B, '[0;37m', '[frOSt] Loading kernel modules (asm)...', 0x1B, '[0m', 10
+msg_loading_mods_len equ $ - msg_loading_mods
+
+msg_mod_prefix:
+    db 0x1B, '[1;32m', '[frOSt]', 0x1B, '[0m', ' '
+msg_mod_prefix_len equ $ - msg_mod_prefix
+
+msg_mod_suffix:
+    db ' modules loaded (asm fast-path)', 10
+msg_mod_suffix_len equ $ - msg_mod_suffix
 
 msg_newline:
     db 10
@@ -659,21 +833,107 @@ path_probe:     db '/frost/probe', 0
 path_sys_block: db '/sys/block', 0
 path_hotplug:   db '/proc/sys/kernel/hotplug', 0
 
+; ── Module path prefix ──
+modpath_prefix: db '/lib/modules/', 0
+
 ; ── Device node paths ──
 dev_console:    db '/dev/console', 0
 dev_null:       db '/dev/null', 0
 dev_zero:       db '/dev/zero', 0
 dev_tty:        db '/dev/tty', 0
 
-; ── mdev path for hotplug ──
-mdev_path:      db '/bin/mdev', 0
+; ── mdev path (length excludes null terminator) ──
+mdev_path:      db '/bin/mdev'
 mdev_path_len   equ $ - mdev_path
+                db 0
 
-; ── tmpfs mount option prefix ──
-tmpfs_size_prefix: db 'size=', 0
+; ── Empty params for finit_module ──
+mod_empty_params: db 0
+
+; ── Device node table: [ptr, mode, dev] entries, null-terminated ──
+devnode_table:
+    dq dev_console
+    dd S_IFCHR | 0o622, (5 << 8) | 1
+    dq dev_null
+    dd S_IFCHR | 0o666, (1 << 8) | 3
+    dq dev_zero
+    dd S_IFCHR | 0o666, (1 << 8) | 5
+    dq dev_tty
+    dd S_IFCHR | 0o666, (5 << 8) | 0
+    dq 0                                ; sentinel
+
+; =============================================================================
+; Module table: relative paths under /lib/modules/<kver>/kernel/
+; Null-terminated entries. Table ends with a lone 0 byte.
+; Dependency order: load prerequisites before dependents.
+; =============================================================================
+mod_table:
+    ; -- SCSI / ATA core --
+    db 'drivers/scsi/scsi_common.ko', 0
+    db 'drivers/scsi/scsi_mod.ko', 0
+    db 'block/t10-pi.ko', 0
+    db 'crypto/crct10dif_common.ko', 0
+    db 'crypto/crct10dif_generic.ko', 0
+    db 'lib/crc-t10dif.ko', 0
+    db 'crypto/crc32c_generic.ko', 0
+    db 'lib/crc64-rocksoft.ko', 0
+    db 'drivers/scsi/sd_mod.ko', 0
+    db 'drivers/scsi/sg.ko', 0
+    db 'drivers/ata/libata.ko', 0
+    db 'drivers/ata/ata_piix.ko', 0
+    db 'drivers/ata/ata_generic.ko', 0
+    db 'drivers/ata/libahci.ko', 0
+    db 'drivers/ata/ahci.ko', 0
+    ; -- VirtIO (QEMU) --
+    db 'drivers/virtio/virtio.ko', 0
+    db 'drivers/virtio/virtio_ring.ko', 0
+    db 'drivers/virtio/virtio_pci.ko', 0
+    db 'drivers/virtio/virtio_pci_modern_dev.ko', 0
+    db 'drivers/virtio/virtio_pci_legacy_dev.ko', 0
+    db 'drivers/block/virtio_blk.ko', 0
+    db 'drivers/scsi/virtio_scsi.ko', 0
+    db 'drivers/net/virtio_net.ko', 0
+    ; -- USB stack --
+    db 'drivers/usb/common/usb-common.ko', 0
+    db 'drivers/usb/core/usbcore.ko', 0
+    db 'drivers/usb/host/xhci-hcd.ko', 0
+    db 'drivers/usb/host/xhci-pci.ko', 0
+    db 'drivers/usb/host/ehci-hcd.ko', 0
+    db 'drivers/usb/host/ehci-pci.ko', 0
+    db 'drivers/usb/storage/usb-storage.ko', 0
+    ; -- Filesystems --
+    db 'fs/jbd2/jbd2.ko', 0
+    db 'fs/mbcache.ko', 0
+    db 'lib/crc16.ko', 0
+    db 'fs/ext4/ext4.ko', 0
+    db 'fs/squashfs/squashfs.ko', 0
+    db 'fs/overlayfs/overlay.ko', 0
+    db 'drivers/block/loop.ko', 0
+    db 'fs/fat/fat.ko', 0
+    db 'fs/fat/vfat.ko', 0
+    db 'fs/nls/nls_cp437.ko', 0
+    db 'fs/nls/nls_utf8.ko', 0
+    db 'fs/nls/nls_ascii.ko', 0
+    ; -- HID --
+    db 'drivers/hid/hid.ko', 0
+    db 'drivers/hid/usbhid/usbhid.ko', 0
+    db 'drivers/hid/hid-generic.ko', 0
+    ; -- DRM --
+    db 'drivers/gpu/drm/drm.ko', 0
+    db 'drivers/gpu/drm/drm_kms_helper.ko', 0
+    db 'drivers/gpu/drm/tiny/bochs.ko', 0
+    db 'drivers/gpu/drm/virtio/virtio-gpu.ko', 0
+    ; -- End --
+    db 0
+
 
 ; =============================================================================
 ; BSS Section
 ; =============================================================================
 section .bss
 total_ram:      resq 1
+kver_buf:       resb 65
+kver_len:       resb 1
+modpath_buf:    resb 256
+modpath_len:    resd 1
+pathbuild_buf:  resb 512

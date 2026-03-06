@@ -1,53 +1,140 @@
-/* frOSt GTK3 Theme Overlay
- * Applied on top of Adwaita-dark to add frost color accents
- * Colors: cyan #00d4ff, red #ff2d2d, navy #0a1628
+/* frOSt GTK3 Theme Overlay - HACKER EDITION
+ * Cyberpunk neon theme with cyan/purple accents
+ * Colors: cyan #00d4ff, purple #7b2cbf, red #ff2d2d, navy #0a1628
  */
 
-/* Selection colors */
+/* === NEON GLOW EFFECTS === */
+
+/* Global neon text shadow for highlights */
+label:selected,
+button:checked label {
+    text-shadow: 0 0 8px rgba(0, 212, 255, 0.6),
+                 0 0 16px rgba(123, 44, 191, 0.3);
+}
+
+/* Window header - dark with neon accent */
+window.csd headerbar {
+    background-color: #0a0f1a;
+    border-bottom: 2px solid rgba(0, 212, 255, 0.3);
+    box-shadow: 0 0 20px rgba(0, 212, 255, 0.1);
+}
+
+/* Selection colors - cyan neon */
 *:selected,
 *:selected:focus {
     background-color: #0090c1;
-    color: #e0f0ff;
+    color: #00d4ff;
+    text-shadow: 0 0 6px rgba(0, 212, 255, 0.8);
 }
 
 selection {
     background-color: #0090c1;
-    color: #e0f0ff;
-}
-
-/* Links */
-*:link, button:link {
     color: #00d4ff;
 }
 
-/* Focused elements - cyan outline */
+/* Links - bright cyan with glow */
+*:link, button:link {
+    color: #00d4ff;
+    text-shadow: 0 0 4px rgba(0, 212, 255, 0.5);
+}
+
+*:link:visited, button:link:visited {
+    color: #9d4edd;
+    text-shadow: 0 0 4px rgba(157, 78, 221, 0.5);
+}
+
+/* Focused elements - cyan neon outline */
 *:focus {
-    outline-color: rgba(0, 212, 255, 0.5);
+    outline-color: rgba(0, 212, 255, 0.8);
+    outline-width: 2px;
 }
 
 entry:focus,
 spinbutton:focus,
 textview:focus {
-    border-color: #0090c1;
-    box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.3);
+    border-color: #00d4ff;
+    box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.3),
+                0 0 12px rgba(0, 212, 255, 0.2);
 }
 
-/* Switches - cyan when active */
+/* Buttons - hover glow effect */
+button:hover {
+    background-color: rgba(0, 212, 255, 0.1);
+    box-shadow: 0 0 8px rgba(0, 212, 255, 0.3);
+}
+
+button:active {
+    background-color: rgba(0, 212, 255, 0.2);
+    box-shadow: 0 0 12px rgba(0, 212, 255, 0.5);
+}
+
+/* Switches - neon cyan when active */
 switch:checked {
     background-color: #0090c1;
-    border-color: #00779a;
+    border-color: #00d4ff;
+    box-shadow: 0 0 8px rgba(0, 212, 255, 0.4);
 }
 
 switch:checked slider {
     background-color: #00d4ff;
+    box-shadow: 0 0 6px rgba(0, 212, 255, 0.8);
 }
 
-/* Check/Radio buttons */
+/* Check/Radio buttons - neon effect */
 checkbutton check:checked,
 radiobutton radio:checked {
     background-color: #0090c1;
-    border-color: #00779a;
-    color: #e0f0ff;
+    border-color: #00d4ff;
+    color: #00d4ff;
+    box-shadow: 0 0 6px rgba(0, 212, 255, 0.5);
+}
+
+/* Spinbutton/scale - neon accent */
+spinbutton:not(:disabled),
+scale:not(:disabled) {
+    color: #00d4ff;
+}
+
+scale slider:hover {
+    box-shadow: 0 0 8px rgba(0, 212, 255, 0.6);
+}
+
+/* Menubar - dark with underline glow */
+menubar {
+    background-color: #0a0f1a;
+    border-bottom: 1px solid rgba(0, 212, 255, 0.2);
+}
+
+menubar > menuitem:hover {
+    background-color: rgba(0, 212, 255, 0.1);
+    box-shadow: inset 0 -2px 0 0 #00d4ff;
+}
+
+/* Popover/Menu - dark background */
+popover,
+popover.menu {
+    background-color: #0f1419;
+    border: 1px solid rgba(0, 212, 255, 0.2);
+    box-shadow: 0 0 20px rgba(0, 0, 0, 0.8),
+                0 0 40px rgba(0, 212, 255, 0.1);
+}
+
+popover menuitem:hover {
+    background-color: rgba(0, 212, 255, 0.1);
+    color: #00d4ff;
+}
+
+/* Scrollbar - neon accent */
+scrollbar slider {
+    background-color: #1a2a3a;
+    border: 1px solid rgba(0, 212, 255, 0.3);
+}
+
+scrollbar slider:hover {
+    background-color: #2a3a4a;
+    border-color: #00d4ff;
+    box-shadow: 0 0 6px rgba(0, 212, 255, 0.4);
+}
 }
 
 /* Progress bars */

@@ -1,0 +1,186 @@
+#!/bin/bash
+# =============================================================================
+# frOSt Build & Test Report Template
+# =============================================================================
+# Fill this in after completing build, QEMU test, and optional hardware test
+# =============================================================================
+
+cat << 'EOF'
+╔════════════════════════════════════════════════════════════════╗
+║               frOSt Build & Test Report                        ║
+╚════════════════════════════════════════════════════════════════╝
+
+DATE: [FILL IN]
+TESTER: [FILL IN]
+BUILD TIME: [HH:MM from start to completion]
+
+═══════════════════════════════════════════════════════════════════
+SECTION 1: BUILD COMPLETION
+═══════════════════════════════════════════════════════════════════
+
+Build Script:  bash build.sh
+Exit Code:     [________]  (expected: 0)
+Log File:      full-build.log
+Image Size:    [________] GB
+Image Path:    /root/frost-build/frost.img
+
+Errors in log:  [ ] None   [ ] Minor (non-blocking)   [ ] Fatal
+Details: _______________________________________________________________
+
+═══════════════════════════════════════════════════════════════════
+SECTION 2: QEMU BOOT TEST
+═══════════════════════════════════════════════════════════════════
+
+Test Command:  bash test.sh desktop
+Environment:   [ ] Windows/WSL  [ ] Linux  [ ] macOS
+Status:        [ ] PASS  [ ] FAIL  [ ] SKIP
+
+Boot Behavior:
+  [ ] No kernel panic
+  [ ] systemd startup clean
+  [ ] Reached login prompt
+  [ ] Desktop environment loaded
+
+Issues Encountered: ____________________________________________________
+________________________________________________________________________
+
+═══════════════════════════════════════════════════════════════════
+SECTION 3: FEATURE VALIDATION (QEMU)
+═══════════════════════════════════════════════════════════════════
+
+Boot Environment:
+  [ ] XFCE4 loaded
+  [ ] Panel visible
+  [ ] Terminal works
+
+Visual Theme:
+  [ ] Dark mode applied (Adwaita-dark)
+  [ ] Cyan/purple accents visible
+  [ ] Window decorations correct
+
+Desktop Features:
+  [ ] Spinning logo visible (lower-left)
+  [ ] Logo smooth animation (no flicker)
+  [ ] Conky system monitor (top-right)
+  [ ] Conky shows system stats correctly
+
+Filesystem:
+  [ ] /frost/lower exists (squashfs)
+  [ ] /frost/upper exists (tmpfs)
+  [ ] /frost/merged mounted (overlayfs)
+  [ ] /frost/persist mounted
+
+Persistence:
+  [ ] /frost/persist/frost-persist.json exists
+  [ ] Can create files in persistent paths
+  [ ] Files persist across reboots (if tested)
+
+Tools:
+  [ ] Firefox launches
+  [ ] Terminal respects color theme
+  [ ] Neofetch shows correct logo
+  [ ] Conky renders without errors
+
+Issues Encountered: ____________________________________________________
+________________________________________________________________________
+
+═══════════════════════════════════════════════════════════════════
+SECTION 4: USB DEPLOYMENT
+═══════════════════════════════════════════════════════════════════
+
+Deploy Script:  deploy.ps1 (Windows) / deploy.sh (Linux)
+Platform:       [ ] Windows  [ ] Linux
+USB Drive:      [________] (e.g., Disk 1, 32GB SanDisk)
+Status:         [ ] PASS  [ ] FAIL  [ ] SKIP
+
+Deploy Time:    [HH:MM]
+Image Write:    [ ] Success  [ ] Fail
+Partition Expand: [ ] Success [ ] Fail
+
+Issues: ________________________________________________________________
+________________________________________________________________________
+
+═══════════════════════════════════════════════════════════════════
+SECTION 5: HARDWARE TEST (OPTIONAL)
+═══════════════════════════════════════════════════════════════════
+
+Hardware:       ASUS TUF Dash F15 FX516PM
+Boot Method:    [ ] USB 3.0  [ ] USB 2.0
+BIOS Mode:      [ ] UEFI  [ ] Legacy
+
+Status:         [ ] PASS  [ ] FAIL  [ ] SKIP
+
+Boot Results:
+  [ ] USB detected in boot menu
+  [ ] GRUB menu appears
+  [ ] Kernel boots without panic
+  [ ] systemd startup clean
+  [ ] Desktop loads (auto-login as 'frost')
+
+Hardware Detection:
+  [ ] CPU detected correctly
+  [ ] RAM detected correctly
+  [ ] Disk space shows correctly (df)
+  [ ] WiFi device detected (lspci)
+
+Network:
+  [ ] WiFi module iwlwifi loads
+  [ ] AX201 firmware detected in dmesg
+  [ ] NetworkManager responsive
+  [ ] Can scan SSIDs (nmcli dev wifi list)
+  [ ] Can connect to SSID
+  [ ] Can ping 8.8.8.8
+
+Desktop on Hardware:
+  [ ] Theme applies correctly
+  [ ] Spinning logo renders
+  [ ] Conky system monitor works
+  [ ] Firefox launches and loads websites
+  [ ] Terminal works at full resolution
+
+Persistence Test:
+  [ ] Create test file: mkdir -p /home/frost/test-persist
+  [ ] Reboot system
+  [ ] Test directory still exists after reboot
+
+Performance:
+  [ ] Boot time acceptable (~30-60 seconds)
+  [ ] Desktop responsive
+  [ ] No thermal throttling observed
+  [ ] System is stable
+
+Issues Encountered: ____________________________________________________
+________________________________________________________________________
+
+═══════════════════════════════════════════════════════════════════
+SECTION 6: OVERALL ASSESSMENT
+═══════════════════════════════════════════════════════════════════
+
+Overall Status:  [ ] READY FOR RELEASE  [ ] NEEDS FIXES  [ ] MAJOR ISSUES
+
+Build Quality:   [ ] Excellent  [ ] Good  [ ] Acceptable  [ ] Poor
+Test Coverage:   [ ] Complete  [ ] Partial  [ ] Minimal
+Feature Completeness: [ ] 100%  [ ] 90%  [ ] 75%  [ ] <50%
+
+Recommended Actions:
+[ ] No action needed - release ready
+[ ] Minor cosmetic fixes only
+[ ] Fix specific features before release
+[ ] Major rework needed
+[ ] Cannot deploy in current state
+
+Details: ________________________________________________________________
+________________________________________________________________________
+________________________________________________________________________
+
+═══════════════════════════════════════════════════════════════════
+SECTION 7: SIGN-OFF
+═══════════════════════════════════════════════════════════════════
+
+Tested By:      [NAME]
+Date:           [DATE]
+Time:           [HH:MM]
+Notes:          ________________________________________________________
+                ________________________________________________________
+
+EOF

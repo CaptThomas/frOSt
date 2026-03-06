@@ -1,0 +1,67 @@
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x4,0x0)
+BdsDxe: starting Boot0001 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x4,0x0)
+[0m[36m[40m[0m[30m[40m[2J[01;01H[0m[36m[40m[02;40HGNU GRUB  version 2.12
+
+[04;02H┌────────────────────────────────────────────────────────────────────────────────────────────────┐[05;02H│[05;99H│[06;02H│[06;99H│[07;02H│[07;99H│[08;02H│[08;99H│[09;02H│[09;99H│[10;02H│[10;99H│[11;02H│[11;99H│[12;02H│[12;99H│[13;02H│[13;99H│[14;02H│[14;99H│[15;02H│[15;99H│[16;02H│[16;99H│[17;02H│[17;99H│[18;02H│[18;99H│[19;02H│[19;99H│[20;02H│[20;99H│[21;02H│[21;99H│[22;02H│[22;99H│[23;02H│[23;99H│[24;02H└────────────────────────────────────────────────────────────────────────────────────────────────┘[25;02H[26;02H     Use the ▲ and ▼ keys to select which entry is highlighted.                              
+      Press enter to boot the selected OS, `e' to edit the commands before booting or `c' for 
+      a command-line.                                                                         [05;:0H [1m[37m[44m[05;03H*frOSt Desktop                                                                                  [0m[36m[40m[05;98H[06;03H frOSt Console                                                                                  [06;98H[07;03H frOSt Recovery                                                                                 [07;98H[08;03H frOSt Debug                                                                                    [08;98H[09;03H                                                                                                [09;98H[10;03H                                                                                                [10;98H[11;03H                                                                                                [11;98H[12;03H                                                                                                [12;98H[13;03H                                                                                                [13;98H[14;03H                                                                                                [14;98H[15;03H                                                                                                [15;98H[16;03H                                                                                                [16;98H[17;03H                                                                                                [17;98H[18;03H                                                                                                [18;98H[19;03H                                                                                                [19;98H[20;03H                                                                                                [20;98H[21;03H                                                                                                [21;98H[22;03H                                                                                                [22;98H[23;03H                                                                                                [23;98H[23;:0H [05;98H[29;01H   The highlighted entry will be executed automatically in 3s.                                     [05;98H[29;01H   The highlighted entry will be executed automatically in 2s.                                     [05;98H[29;01H   The highlighted entry will be executed automatically in 1s.                                     [05;98H[29;01H   The highlighted entry will be executed automatically in 0s.                                     [05;98H[0m[30m[40m[2J[01;01H[0m[36m[40m[0m[30m[40m[2J[01;01H[0m[36m[40m[frOSt] INIT START
+
+[1;34m   +-------------------------------------------------+
+   |[1;36m  *  frOSt Kernel Bootstrap  *                  [1;34m|
+   +-------------------------------------------------+
+[0m
+[1;36m   :::::::::: :::::::::   ::::::::   ::::::::  ::::::::::
+   :+:        :+:    :+: :+:    :+: :+:    :+:    :+:    
+   +:+        +:+    +:+ +:+    +:+ +:+           +:+    
+   :#::+::#   +#++:++#:  +#+    +:+ +#++:++#++    +#+    
+   +#+        +#+    +#+ +#+    +#+        +#+    +#+     
+   #+#        #+#    #+# #+#    #+# #+#    #+#    #+#     
+   ###        ###    ###  ########   ########     ###     
+[0m
+[1;37m  Frozen Operating System v3.0[0m
+[0;36m  x86-64 Assembly + Python Init[0m
+  ------------------------------------------
+[0;37m[frOSt] Kernel: [1;37m6.1.0-42-amd64
+[0;37m[frOSt] RAM: [1;37m1960 MB[0m
+[0;37m[frOSt] Transient overlay tmpfs mounted[0m
+[0;37m[frOSt] mdev hotplug configured[0m
+[0;37m[frOSt] Loading kernel modules (asm)...[0m
+[1;32m[frOSt][0m 42 modules loaded (asm fast-path)
+[0;37m[frOSt] Scanning block devices...[0m
+[1;32m[frOSt] Assembly init complete -> shell bootstrap[0m
+\033[0;37m[frOSt]\033[0m Loading kernel modules...
+\033[1;32m[frOSt]\033[0m Modules loaded (kernel 6.1.0-42-amd64)
+\033[0;37m[frOSt]\033[0m Populating devices...
+\033[0;37m[frOSt]\033[0m Waiting for USB enumeration...
+\033[0;37m[frOSt]\033[0m Searching for frOSt partitions...
+\033[0;37m[frOSt]\033[0m Scan 0/30 - blocks: vda 
+\033[1;32m[frOSt]\033[0m Found FROST_ROOT: /dev/vda2 (findfs)
+\033[0;37m[frOSt]\033[0m Mounting root filesystem...
+\033[1;32m[frOSt]\033[0m Mounted squashfs from rootfs.squashfs
+\033[0;37m[frOSt]\033[0m Handing off to Python init...
+\033[1;32m[frOSt]\033[0m Linker: /frost/lower/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+\033[0;37m[frOSt]\033[0m Running: /frost/lower/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /frost/lower/usr/bin/python3 /frost_init.py
+
+[1;34m[frOSt][0m [1;37mCompiled Python init v3.0.0[0m
+[1;34m[frOSt][0m [0;37mPID 380 | Python 3.11.2[0m
+
+[0;37m[frOSt][0m Root device:    [1;37m/dev/vda2[0m
+[0;37m[frOSt][0m Persist device: [1;37m/dev/vda3[0m
+[0;37m[frOSt][0m Setting up overlay filesystem...
+[1;32m[frOSt][0m Overlay filesystem mounted
+[0;37m[frOSt][0m Mounting persistence: [1;37m/dev/vda3[0m
+[1;32m[frOSt][0m Persistence partition mounted
+[1;32m[frOSt][0m Persistence: 7/7 paths bound
+[0;37m[frOSt][0m Preparing merged root...
+[1;32m[frOSt][0m Merged root prepared
+[1;32m[frOSt][0m Found systemd
+
+[1;36m──────────────────────────────────────────────────[0m
+[1;36m[frOSt][0m [1;37mBoot complete → starting system[0m
+[1;36m──────────────────────────────────────────────────[0m
+
+\033[1;32m[frOSt]\033[0m Python init complete, switching root (init=/lib/systemd/systemd)
+
+Debian GNU/Linux 12 frost ttyS0
+
+frost login: 
